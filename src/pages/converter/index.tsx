@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import GIF from 'gif.js.optimized';
 import {
@@ -78,6 +78,45 @@ const getRecordingOptions = (format: 'webm' | 'mp4') => {
 };
 
 const gifWorkerUrl = new URL('gif.js.optimized/dist/gif.worker.js', import.meta.url).toString();
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const getCropRectForAspect = (
+  rect: { x: number; y: number; width: number; height: number },
+  aspect: number,
+  viewWidth: number,
+  viewHeight: number,
+) => {
+  if (!Number.isFinite(aspect) || aspect <= 0) return rect;
+  if (!Number.isFinite(viewWidth) || !Number.isFinite(viewHeight)) return rect;
+  if (viewWidth <= 0 || viewHeight <= 0) return rect;
+  const viewAspect = viewWidth / viewHeight;
+  let width = 1;
+  let height = 1;
+  if (aspect > viewAspect) {
+    height = viewAspect / aspect;
+  } else {
+    width = aspect / viewAspect;
+  }
+  const centerX = rect.x + rect.width / 2;
+  const centerY = rect.y + rect.height / 2;
+  const nextX = clamp(centerX - width / 2, 0, 1 - width);
+  const nextY = clamp(centerY - height / 2, 0, 1 - height);
+  return { x: nextX, y: nextY, width, height };
+};
+
+const resolutionPresets = [
+  { label: '720p (HD)', width: 1280, height: 720 },
+  { label: '1080p (FHD)', width: 1920, height: 1080 },
+  { label: '1440p (QHD)', width: 2560, height: 1440 },
+  { label: '2160p (4K)', width: 3840, height: 2160 },
+];
+
+const aspectPresets = [
+  { label: '1:1', width: 1, height: 1 },
+  { label: '4:3', width: 4, height: 3 },
+  { label: '9:16', width: 9, height: 16 },
+];
 
 const viewPreset = {
   cameraPosition: new THREE.Vector3(-533.2114976476801, 130.61937589294004, 629.7917070129056),
@@ -186,9 +225,46 @@ const Converter: React.FC = () => {
     format: 'mp4',
     duration: 5,
     gifQuality: 10,
+    viewMode: 'fit',
   });
 
+  const [resolutionMode, setResolutionMode] = useState<'preset' | 'custom'>('preset');
+  const [cropRect, setCropRect] = useState({ x: 0, y: 0, width: 1, height: 1 });
+  const renderConfigRef = useRef(renderConfig);
+  const viewportSizeRef = useRef({ width: 1, height: 1 });
+
+  const presetMatch = resolutionPresets.find(
+    (preset) => preset.width === renderConfig.width && preset.height === renderConfig.height,
+  );
+  const resolutionValue =
+    resolutionMode === 'custom' || !presetMatch
+      ? 'custom'
+      : `${renderConfig.width}x${renderConfig.height}`;
+
+  const toDimension = (value: string | number, fallback: number) => {
+    const parsed = typeof value === 'string' ? Number(value) : value;
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(16, Math.round(parsed));
+  };
+
+  const applyAspectPreset = (preset: { width: number; height: number }) => {
+    const base = Math.max(renderConfig.width, renderConfig.height);
+    const isLandscape = preset.width >= preset.height;
+    const targetWidth = isLandscape ? base : Math.round((base * preset.width) / preset.height);
+    const targetHeight = isLandscape ? Math.round((base * preset.height) / preset.width) : base;
+    const nextWidth = toDimension(targetWidth, renderConfig.width);
+    const nextHeight = toDimension(targetHeight, renderConfig.height);
+    setResolutionMode('custom');
+    setRenderConfig((prev) => ({
+      ...prev,
+      width: nextWidth,
+      height: nextHeight,
+    }));
+    syncCropRectForConfig(nextWidth, nextHeight);
+  };
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const sceneParamsRef = useRef(sceneParams);
   const sceneRef = useRef<{
     scene: THREE.Scene;
@@ -214,7 +290,96 @@ const Converter: React.FC = () => {
     restore: null,
   });
 
+  const recordCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const recordedChunks = useRef<Blob[]>([]);
+  const cropRectRef = useRef(cropRect);
+  const cropDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origin: { x: number; y: number; width: number; height: number };
+    width: number;
+    height: number;
+  } | null>(null);
+
+  useEffect(() => {
+    renderConfigRef.current = renderConfig;
+  }, [renderConfig]);
+
+  useEffect(() => {
+    cropRectRef.current = cropRect;
+  }, [cropRect]);
+
+  const syncCropRectForConfig = useCallback(
+    (nextWidth: number, nextHeight: number, viewWidth?: number, viewHeight?: number) => {
+      const width = viewWidth ?? viewportSizeRef.current.width;
+      const height = viewHeight ?? viewportSizeRef.current.height;
+      setCropRect((prev) => getCropRectForAspect(prev, nextWidth / nextHeight, width, height));
+    },
+    [],
+  );
+
+  const handleViewportResize = useCallback(() => {
+    if (!canvasRef.current || !sceneRef.current) return;
+    if (renderStateRef.current.isRendering) return;
+    const parent = canvasRef.current.parentElement;
+    if (!parent) return;
+    const width = parent.clientWidth;
+    const height = parent.clientHeight;
+    const view = viewportSizeRef.current;
+    if (view.width !== width || view.height !== height) {
+      viewportSizeRef.current = { width, height };
+      const currentConfig = renderConfigRef.current;
+      syncCropRectForConfig(currentConfig.width, currentConfig.height, width, height);
+    }
+    const { camera, renderer } = sceneRef.current;
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+    renderer.setSize(width, height);
+  }, [syncCropRectForConfig]);
+
+  const handleViewportRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      viewportRef.current = node;
+      if (!node) return;
+      const rect = node.getBoundingClientRect();
+      viewportSizeRef.current = { width: rect.width, height: rect.height };
+      const currentConfig = renderConfigRef.current;
+      syncCropRectForConfig(currentConfig.width, currentConfig.height, rect.width, rect.height);
+    },
+    [syncCropRectForConfig],
+  );
+
+  const handleCropPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!viewportRef.current) return;
+    const bounds = viewportRef.current.getBoundingClientRect();
+    cropDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      origin: cropRectRef.current,
+      width: bounds.width,
+      height: bounds.height,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleCropPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = (event.clientX - drag.startX) / drag.width;
+    const dy = (event.clientY - drag.startY) / drag.height;
+    const nextX = clamp(drag.origin.x + dx, 0, 1 - drag.origin.width);
+    const nextY = clamp(drag.origin.y + dy, 0, 1 - drag.origin.height);
+    setCropRect({ ...drag.origin, x: nextX, y: nextY });
+  };
+
+  const handleCropPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    cropDragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  };
 
   // Sync scene state to Three.js objects
   useEffect(() => {
@@ -329,21 +494,19 @@ const Converter: React.FC = () => {
     };
     animate();
 
-    const handleResize = () => {
-      const parent = canvasRef.current?.parentElement;
-      if (parent && !renderStateRef.current.isRendering) {
-        const width = parent.clientWidth;
-        const height = parent.clientHeight;
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
-        renderer.setSize(width, height);
-      }
-    };
-    window.addEventListener('resize', handleResize);
-    handleResize();
+    const parent = canvasRef.current?.parentElement;
+    if (parent && !renderStateRef.current.isRendering) {
+      const width = parent.clientWidth;
+      const height = parent.clientHeight;
+      viewportSizeRef.current = { width, height };
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height);
+    }
+    window.addEventListener('resize', handleViewportResize);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('resize', handleViewportResize);
       renderer.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -475,11 +638,49 @@ const Converter: React.FC = () => {
     renderStateRef.current.restore = restoreAfterRecording;
 
     controls.enabled = false;
-    renderer.setPixelRatio(1);
-    renderer.setSize(renderConfig.width, renderConfig.height, false);
-    camera.aspect = renderConfig.width / renderConfig.height;
-    camera.updateProjectionMatrix();
-    if (model) applyViewForModel(camera, controls, model);
+    if (renderConfig.viewMode === 'fit' && model) {
+      frameCameraToObject(camera, controls, model);
+    }
+
+    const recordCanvas = document.createElement('canvas');
+    recordCanvas.width = renderConfig.width;
+    recordCanvas.height = renderConfig.height;
+    recordCanvasRef.current = recordCanvas;
+    const recordContext = recordCanvas.getContext('2d');
+    if (!recordContext) {
+      setIsRendering(false);
+      renderStateRef.current.isRendering = false;
+      renderStateRef.current.recorder = null;
+      restoreAfterRecording();
+      renderStateRef.current.restore = null;
+      return;
+    }
+
+    const drawCroppedFrame = () => {
+      const source = renderer.domElement;
+      const crop = getCropRectForAspect(
+        cropRectRef.current,
+        renderConfig.width / renderConfig.height,
+        source.width,
+        source.height,
+      );
+      const sw = Math.max(1, crop.width * source.width);
+      const sh = Math.max(1, crop.height * source.height);
+      const sx = clamp(crop.x * source.width, 0, source.width - sw);
+      const sy = clamp(crop.y * source.height, 0, source.height - sh);
+      recordContext.clearRect(0, 0, recordCanvas.width, recordCanvas.height);
+      recordContext.drawImage(
+        source,
+        sx,
+        sy,
+        sw,
+        sh,
+        0,
+        0,
+        recordCanvas.width,
+        recordCanvas.height,
+      );
+    };
 
     const root = mixer.getRoot() as THREE.Object3D & { animations: THREE.AnimationClip[] };
     const animationList = (root.userData?.animations ||
@@ -523,7 +724,8 @@ const Converter: React.FC = () => {
         const time = clipDuration > 0 ? elapsed % clipDuration : 0;
         mixer.setTime(time);
         renderer.render(scene, camera);
-        gif.addFrame(renderer.domElement, { copy: true, delay: frameDelayMs });
+        drawCroppedFrame();
+        gif.addFrame(recordCanvas, { copy: true, delay: frameDelayMs });
         await new Promise((r) => setTimeout(r, frameDelayMs));
         setProgress(Math.round(((i + 1) / totalFrames) * 100));
       }
@@ -540,7 +742,8 @@ const Converter: React.FC = () => {
       return;
     }
 
-    const stream = canvasRef.current.captureStream(renderConfig.fps);
+    drawCroppedFrame();
+    const stream = recordCanvas.captureStream(renderConfig.fps);
     const { mimeType, format: formatUsedRaw, notice } = getRecordingOptions(renderConfig.format);
     let formatUsed = formatUsedRaw;
     if (notice) setRenderNotice(t.formatFallback);
@@ -602,6 +805,7 @@ const Converter: React.FC = () => {
       const time = clipDuration > 0 ? elapsed % clipDuration : 0;
       mixer.setTime(time);
       renderer.render(scene, camera);
+      drawCroppedFrame();
       await new Promise((r) => setTimeout(r, frameDelayMs));
       setProgress(Math.round(((i + 1) / totalFrames) * 100));
     }
@@ -649,6 +853,8 @@ const Converter: React.FC = () => {
     }
     setIsRendering(false);
   };
+
+  const canAdjustCrop = activeTab === 'export' && !isRendering;
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-slate-100 selection:bg-indigo-500/30 font-sans">
@@ -956,22 +1162,127 @@ const Converter: React.FC = () => {
                       </label>
                       <label className="block">
                         <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
+                          {t.viewMode}
+                        </span>
+                        <div className="grid grid-cols-2 gap-3">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRenderConfig((prev) => ({ ...prev, viewMode: 'fit' }))
+                            }
+                            className={`px-3 py-2 rounded-xl text-[11px] font-semibold border transition ${
+                              renderConfig.viewMode === 'fit'
+                                ? 'bg-indigo-600 border-indigo-500 text-white'
+                                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+                            }`}
+                          >
+                            {t.viewModeFit}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRenderConfig((prev) => ({ ...prev, viewMode: 'current' }))
+                            }
+                            className={`px-3 py-2 rounded-xl text-[11px] font-semibold border transition ${
+                              renderConfig.viewMode === 'current'
+                                ? 'bg-indigo-600 border-indigo-500 text-white'
+                                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+                            }`}
+                          >
+                            {t.viewModeCurrent}
+                          </button>
+                        </div>
+                      </label>
+                      <label className="block">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
                           {t.resolution}
                         </span>
                         <select
                           className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                          value={`${renderConfig.width}x${renderConfig.height}`}
+                          value={resolutionValue}
                           onChange={(e) => {
+                            if (e.target.value === 'custom') {
+                              setResolutionMode('custom');
+                              return;
+                            }
+                            setResolutionMode('preset');
                             const [w, h] = e.target.value.split('x').map(Number);
                             setRenderConfig((prev) => ({ ...prev, width: w, height: h }));
+                            syncCropRectForConfig(w, h);
                           }}
                         >
-                          <option value="1280x720">720p (HD)</option>
-                          <option value="1920x1080">1080p (FHD)</option>
-                          <option value="2560x1440">1440p (QHD)</option>
-                          <option value="3840x2160">2160p (4K)</option>
+                          {resolutionPresets.map((preset) => (
+                            <option
+                              key={`${preset.width}x${preset.height}`}
+                              value={`${preset.width}x${preset.height}`}
+                            >
+                              {preset.label}
+                            </option>
+                          ))}
+                          <option value="custom">{t.customResolution}</option>
                         </select>
                       </label>
+                      <div className="space-y-2">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block">
+                          {t.aspectPresets}
+                        </span>
+                        <div className="grid grid-cols-3 gap-2">
+                          {aspectPresets.map((preset) => (
+                            <button
+                              key={preset.label}
+                              type="button"
+                              onClick={() => applyAspectPreset(preset)}
+                              className="px-2 py-2 rounded-lg text-[11px] font-semibold border border-white/10 text-slate-300 bg-white/5 hover:bg-white/10 transition"
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {resolutionValue === 'custom' && (
+                        <div className="grid grid-cols-2 gap-4">
+                          <label className="block">
+                            <span className="text-[9px] text-slate-500 uppercase mb-1 block">
+                              {t.width}
+                            </span>
+                            <input
+                              type="number"
+                              min="16"
+                              step="1"
+                              className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
+                              value={renderConfig.width}
+                              onChange={(e) => {
+                                const nextWidth = toDimension(e.target.value, renderConfig.width);
+                                setRenderConfig((prev) => ({
+                                  ...prev,
+                                  width: nextWidth,
+                                }));
+                                syncCropRectForConfig(nextWidth, renderConfig.height);
+                              }}
+                            />
+                          </label>
+                          <label className="block">
+                            <span className="text-[9px] text-slate-500 uppercase mb-1 block">
+                              {t.height}
+                            </span>
+                            <input
+                              type="number"
+                              min="16"
+                              step="1"
+                              className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
+                              value={renderConfig.height}
+                              onChange={(e) => {
+                                const nextHeight = toDimension(e.target.value, renderConfig.height);
+                                setRenderConfig((prev) => ({
+                                  ...prev,
+                                  height: nextHeight,
+                                }));
+                                syncCropRectForConfig(renderConfig.width, nextHeight);
+                              }}
+                            />
+                          </label>
+                        </div>
+                      )}
                       <label className="block">
                         <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
                           {t.framerate}
@@ -1065,8 +1376,59 @@ const Converter: React.FC = () => {
         </aside>
 
         {/* Viewport */}
-        <section className="flex-1 relative bg-black group overflow-hidden">
+        <section ref={handleViewportRef} className="flex-1 relative bg-black group overflow-hidden">
           <canvas ref={canvasRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+
+          {!isRendering && metadata && (
+            <div className="absolute inset-0 pointer-events-none">
+              <div
+                className="absolute border-2 border-indigo-400/80 rounded-lg shadow-[0_0_0_9999px_rgba(0,0,0,0.35)]"
+                style={{
+                  left: `${cropRect.x * 100}%`,
+                  top: `${cropRect.y * 100}%`,
+                  width: `${cropRect.width * 100}%`,
+                  height: `${cropRect.height * 100}%`,
+                }}
+              >
+                {canAdjustCrop && (
+                  <>
+                    <div
+                      className="absolute inset-x-0 top-0 h-4 cursor-move pointer-events-auto"
+                      style={{ touchAction: 'none' }}
+                      onPointerDown={handleCropPointerDown}
+                      onPointerMove={handleCropPointerMove}
+                      onPointerUp={handleCropPointerUp}
+                      onPointerCancel={handleCropPointerUp}
+                    />
+                    <div
+                      className="absolute inset-x-0 bottom-0 h-4 cursor-move pointer-events-auto"
+                      style={{ touchAction: 'none' }}
+                      onPointerDown={handleCropPointerDown}
+                      onPointerMove={handleCropPointerMove}
+                      onPointerUp={handleCropPointerUp}
+                      onPointerCancel={handleCropPointerUp}
+                    />
+                    <div
+                      className="absolute inset-y-0 left-0 w-4 cursor-move pointer-events-auto"
+                      style={{ touchAction: 'none' }}
+                      onPointerDown={handleCropPointerDown}
+                      onPointerMove={handleCropPointerMove}
+                      onPointerUp={handleCropPointerUp}
+                      onPointerCancel={handleCropPointerUp}
+                    />
+                    <div
+                      className="absolute inset-y-0 right-0 w-4 cursor-move pointer-events-auto"
+                      style={{ touchAction: 'none' }}
+                      onPointerDown={handleCropPointerDown}
+                      onPointerMove={handleCropPointerMove}
+                      onPointerUp={handleCropPointerUp}
+                      onPointerCancel={handleCropPointerUp}
+                    />
+                  </>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="absolute top-6 left-6 pointer-events-none">
             <div className="bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 flex items-center gap-3">

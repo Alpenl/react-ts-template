@@ -33,4 +33,5 @@ export interface RenderingConfig {
   format: 'webm' | 'mp4' | 'gif';
   duration: number;
   gifQuality: number;
+  viewMode: 'fit' | 'current';
 }
