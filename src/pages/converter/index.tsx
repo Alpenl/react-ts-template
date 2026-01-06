@@ -33,9 +33,103 @@ const needsPreciseBounds = (model: THREE.Object3D) => {
   return precise;
 };
 
+const getBoneBounds = (root: THREE.Object3D) => {
+  const box = new THREE.Box3();
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  let hasBone = false;
+  const worldPos = new THREE.Vector3();
+
+  root.updateMatrixWorld(true);
+  root.traverse((child) => {
+    if ((child as THREE.Bone).isBone) {
+      hasBone = true;
+      child.getWorldPosition(worldPos);
+      min.min(worldPos);
+      max.max(worldPos);
+    }
+  });
+
+  if (!hasBone) return box;
+  box.min.copy(min);
+  box.max.copy(max);
+  return box;
+};
+
+const getNodeBounds = (root: THREE.Object3D) => {
+  const box = new THREE.Box3();
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  let hasNode = false;
+  const worldPos = new THREE.Vector3();
+
+  root.updateMatrixWorld(true);
+  root.traverse((child) => {
+    hasNode = true;
+    child.getWorldPosition(worldPos);
+    min.min(worldPos);
+    max.max(worldPos);
+  });
+
+  if (!hasNode) return box;
+  box.min.copy(min);
+  box.max.copy(max);
+  return box;
+};
+
+const getObjectBounds = (root: THREE.Object3D, precise = false) => {
+  const box = new THREE.Box3().setFromObject(root, precise);
+  if (!box.isEmpty()) return box;
+  const boneBox = getBoneBounds(root);
+  if (!boneBox.isEmpty()) return boneBox;
+  return getNodeBounds(root);
+};
+
+type RigHelper = {
+  helper: THREE.LineSegments;
+  pairs: Array<{ child: THREE.Object3D; parent: THREE.Object3D }>;
+};
+
+const createRigHelper = (root: THREE.Object3D): RigHelper | null => {
+  const pairs: Array<{ child: THREE.Object3D; parent: THREE.Object3D }> = [];
+  root.updateMatrixWorld(true);
+  root.traverse((child) => {
+    if (child === root) return;
+    if (!child.parent) return;
+    pairs.push({ child, parent: child.parent });
+  });
+  if (pairs.length === 0) return null;
+  const positions = new Float32Array(pairs.length * 2 * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0xff7a18,
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.9,
+  });
+  const helper = new THREE.LineSegments(geometry, material);
+  helper.frustumCulled = false;
+  return { helper, pairs };
+};
+
+const updateRigHelper = (rig: RigHelper) => {
+  const position = rig.helper.geometry.getAttribute('position') as THREE.BufferAttribute;
+  const worldPos = new THREE.Vector3();
+  let idx = 0;
+  for (const { child, parent } of rig.pairs) {
+    child.getWorldPosition(worldPos);
+    position.setXYZ(idx++, worldPos.x, worldPos.y, worldPos.z);
+    parent.getWorldPosition(worldPos);
+    position.setXYZ(idx++, worldPos.x, worldPos.y, worldPos.z);
+  }
+  position.needsUpdate = true;
+};
+
 const alignRootToGround = (root: THREE.Object3D, targetSize = 250, precise = false) => {
   root.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(root, precise);
+  const box = getObjectBounds(root, precise);
   if (box.isEmpty()) return;
 
   const size = box.getSize(new THREE.Vector3());
@@ -44,7 +138,7 @@ const alignRootToGround = (root: THREE.Object3D, targetSize = 250, precise = fal
   root.scale.setScalar(scale);
   root.updateMatrixWorld(true);
 
-  const scaledBox = new THREE.Box3().setFromObject(root, precise);
+  const scaledBox = getObjectBounds(root, precise);
   if (scaledBox.isEmpty()) return;
   const center = scaledBox.getCenter(new THREE.Vector3());
   root.position.set(-center.x, -scaledBox.min.y, -center.z);
@@ -105,6 +199,19 @@ const getCropRectForAspect = (
   return { x: nextX, y: nextY, width, height };
 };
 
+const getClipFrameCount = (clip: THREE.AnimationClip | null) => {
+  if (!clip) return 0;
+  let maxFrames = 0;
+  for (const track of clip.tracks) {
+    const count = track.times.length;
+    if (count > maxFrames) maxFrames = count;
+  }
+  if (maxFrames > 0) return maxFrames;
+  if (Number.isFinite(clip.duration) && clip.duration > 0)
+    return Math.max(1, Math.round(clip.duration * 60));
+  return 0;
+};
+
 const resolutionPresets = [
   { label: '720p (HD)', width: 1280, height: 720 },
   { label: '1080p (FHD)', width: 1920, height: 1080 },
@@ -146,7 +253,7 @@ const frameCameraToObject = (
   margin = 2,
 ) => {
   object.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(object, true);
+  const box = getObjectBounds(object, true);
   if (box.isEmpty()) return;
 
   const size = box.getSize(new THREE.Vector3());
@@ -199,6 +306,7 @@ const Converter: React.FC = () => {
   const [videoFormat, setVideoFormat] = useState<'webm' | 'mp4' | 'gif'>('webm');
   const [renderNotice, setRenderNotice] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
+  const [frameProgress, setFrameProgress] = useState({ current: 0, total: 0 });
   const [activeTab, setActiveTab] = useState<'info' | 'settings' | 'export'>('info');
 
   const [sceneParams, setSceneParams] = useState<SceneConfig>({
@@ -272,6 +380,8 @@ const Converter: React.FC = () => {
     renderer: THREE.WebGLRenderer;
     mixer: THREE.AnimationMixer | null;
     model: THREE.Group | THREE.Object3D | null;
+    skeletonHelper: THREE.SkeletonHelper | null;
+    rigHelper: RigHelper | null;
     clock: THREE.Clock;
     controls: OrbitControls;
     mainLight: THREE.DirectionalLight;
@@ -477,6 +587,8 @@ const Converter: React.FC = () => {
       renderer,
       mixer: null,
       model: null,
+      skeletonHelper: null,
+      rigHelper: null,
       clock,
       controls,
       mainLight,
@@ -490,6 +602,12 @@ const Converter: React.FC = () => {
       const delta = clock.getDelta() * sceneParamsRef.current.animationSpeed;
       if (sceneRef.current?.mixer) sceneRef.current.mixer.update(delta);
       if (sceneRef.current?.controls) sceneRef.current.controls.update();
+      if (sceneRef.current?.skeletonHelper) {
+        sceneRef.current.skeletonHelper.updateMatrixWorld(true);
+      }
+      if (sceneRef.current?.rigHelper) {
+        updateRigHelper(sceneRef.current.rigHelper);
+      }
       renderer.render(scene, camera);
     };
     animate();
@@ -538,20 +656,54 @@ const Converter: React.FC = () => {
           const gltf = await new Promise<any>((resolve, reject) => {
             loader.parse(contents, '', resolve, reject);
           });
-          object = gltf.scene;
+          let sceneRoot = gltf.scene ?? gltf.scenes?.[0] ?? null;
+          if (!sceneRoot || sceneRoot.children.length === 0) {
+            const nodes = await gltf.parser.getDependencies('node');
+            const rootNodes = nodes.filter((node: THREE.Object3D) => !node.parent);
+            if (rootNodes.length > 0) {
+              const group = new THREE.Group();
+              rootNodes.forEach((node: THREE.Object3D) => group.add(node));
+              sceneRoot = group;
+            }
+          }
+          object = sceneRoot;
           animations = gltf.animations;
         }
 
         if (!object) throw new Error('Unsupported format');
 
         if (sceneRef.current?.model) sceneRef.current.scene.remove(sceneRef.current.model);
+        if (sceneRef.current?.skeletonHelper) {
+          sceneRef.current.scene.remove(sceneRef.current.skeletonHelper);
+          sceneRef.current.skeletonHelper.geometry.dispose();
+          if (Array.isArray(sceneRef.current.skeletonHelper.material)) {
+            sceneRef.current.skeletonHelper.material.forEach((material) => material.dispose());
+          } else {
+            sceneRef.current.skeletonHelper.material.dispose();
+          }
+          sceneRef.current.skeletonHelper = null;
+        }
+        if (sceneRef.current?.rigHelper) {
+          sceneRef.current.scene.remove(sceneRef.current.rigHelper.helper);
+          sceneRef.current.rigHelper.helper.geometry.dispose();
+          if (Array.isArray(sceneRef.current.rigHelper.helper.material)) {
+            sceneRef.current.rigHelper.helper.material.forEach((material) => material.dispose());
+          } else {
+            sceneRef.current.rigHelper.helper.material.dispose();
+          }
+          sceneRef.current.rigHelper = null;
+        }
 
         const root = new THREE.Group();
         root.add(object);
         const preciseBounds = needsPreciseBounds(object);
 
+        let hasMesh = false;
+        let hasBone = false;
         object.traverse((child) => {
+          if ((child as THREE.Bone).isBone) hasBone = true;
           if ((child as THREE.Mesh).isMesh) {
+            hasMesh = true;
             child.castShadow = true;
             child.receiveShadow = true;
           }
@@ -569,9 +721,27 @@ const Converter: React.FC = () => {
         alignRootToGround(root, 250, preciseBounds);
 
         sceneRef.current!.scene.add(root);
+        if (!hasMesh && hasBone) {
+          const helper = new THREE.SkeletonHelper(root);
+          helper.material = new THREE.LineBasicMaterial({ color: 0xff7a18 });
+          helper.frustumCulled = false;
+          sceneRef.current!.scene.add(helper);
+          sceneRef.current!.skeletonHelper = helper;
+        } else if (!hasMesh) {
+          const rigHelper = createRigHelper(root);
+          if (rigHelper) {
+            sceneRef.current!.scene.add(rigHelper.helper);
+            sceneRef.current!.rigHelper = rigHelper;
+            updateRigHelper(rigHelper);
+          }
+        }
         sceneRef.current!.model = root;
         sceneRef.current!.mixer = mixer;
-        applyViewForModel(sceneRef.current!.camera, sceneRef.current!.controls, root);
+        if (!hasMesh) {
+          frameCameraToObject(sceneRef.current!.camera, sceneRef.current!.controls, root);
+        } else {
+          applyViewForModel(sceneRef.current!.camera, sceneRef.current!.controls, root);
+        }
 
         const meta: ModelMetadata = {
           name: uploadedFile.name,
@@ -582,6 +752,8 @@ const Converter: React.FC = () => {
           if ((child as THREE.Bone).isBone) meta.boneCount++;
         });
 
+        const primaryClip = animations[0] ?? null;
+        setFrameProgress({ current: 0, total: getClipFrameCount(primaryClip) });
         setMetadata(meta);
         setActiveTab('info');
       } catch (err) {
@@ -688,11 +860,24 @@ const Converter: React.FC = () => {
       []) as THREE.AnimationClip[];
     const animation = animationList.length > 0 ? animationList[0] : null;
 
+    const clipFrameTotal = getClipFrameCount(animation);
+    setFrameProgress({ current: 0, total: clipFrameTotal });
+
     const clipDuration = animation ? mixer.existingAction(animation)?.getClip().duration || 0 : 0;
     const targetDuration = renderConfig.duration > 0 ? renderConfig.duration : clipDuration || 5;
     const totalFrames = Math.max(1, Math.ceil(targetDuration * renderConfig.fps));
     const frameTime = 1 / renderConfig.fps;
     const frameDelayMs = 1000 / renderConfig.fps;
+
+    const updateFrameProgress = (time: number) => {
+      if (clipFrameTotal <= 0 || clipDuration <= 0) return;
+      const normalized = clamp(time / clipDuration, 0, 1);
+      const nextFrame = Math.min(
+        clipFrameTotal,
+        Math.max(1, Math.floor(normalized * clipFrameTotal) + 1),
+      );
+      setFrameProgress({ current: nextFrame, total: clipFrameTotal });
+    };
 
     mixer.stopAllAction();
     const action = animation ? mixer.clipAction(animation) : null;
@@ -713,6 +898,7 @@ const Converter: React.FC = () => {
         setVideoFormat('gif');
         setIsRendering(false);
         setProgress(100);
+        setFrameProgress((prev) => ({ ...prev, current: prev.total }));
         renderStateRef.current.isRendering = false;
         renderStateRef.current.gif = null;
         restoreAfterRecording();
@@ -723,8 +909,15 @@ const Converter: React.FC = () => {
         const elapsed = i * frameTime * sceneParams.animationSpeed;
         const time = clipDuration > 0 ? elapsed % clipDuration : 0;
         mixer.setTime(time);
+        if (sceneRef.current?.skeletonHelper) {
+          sceneRef.current.skeletonHelper.updateMatrixWorld(true);
+        }
+        if (sceneRef.current?.rigHelper) {
+          updateRigHelper(sceneRef.current.rigHelper);
+        }
         renderer.render(scene, camera);
         drawCroppedFrame();
+        updateFrameProgress(time);
         gif.addFrame(recordCanvas, { copy: true, delay: frameDelayMs });
         await new Promise((r) => setTimeout(r, frameDelayMs));
         setProgress(Math.round(((i + 1) / totalFrames) * 100));
@@ -785,6 +978,7 @@ const Converter: React.FC = () => {
       setVideoFormat(formatUsed);
       setIsRendering(false);
       setProgress(100);
+      setFrameProgress((prev) => ({ ...prev, current: prev.total }));
       renderStateRef.current.isRendering = false;
       renderStateRef.current.recorder = null;
       restoreAfterRecording();
@@ -804,8 +998,15 @@ const Converter: React.FC = () => {
       const elapsed = i * frameTime * sceneParams.animationSpeed;
       const time = clipDuration > 0 ? elapsed % clipDuration : 0;
       mixer.setTime(time);
+      if (sceneRef.current?.skeletonHelper) {
+        sceneRef.current.skeletonHelper.updateMatrixWorld(true);
+      }
+      if (sceneRef.current?.rigHelper) {
+        updateRigHelper(sceneRef.current.rigHelper);
+      }
       renderer.render(scene, camera);
       drawCroppedFrame();
+      updateFrameProgress(time);
       await new Promise((r) => setTimeout(r, frameDelayMs));
       setProgress(Math.round(((i + 1) / totalFrames) * 100));
     }
@@ -852,9 +1053,14 @@ const Converter: React.FC = () => {
       renderStateRef.current.restore = null;
     }
     setIsRendering(false);
+    setFrameProgress((prev) => ({ ...prev, current: 0 }));
   };
 
   const canAdjustCrop = activeTab === 'export' && !isRendering;
+  const framePercent =
+    frameProgress.total > 0
+      ? Math.min(100, Math.round((frameProgress.current / frameProgress.total) * 100))
+      : 0;
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-slate-100 selection:bg-indigo-500/30 font-sans">
@@ -1444,11 +1650,33 @@ const Converter: React.FC = () => {
           <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20">
             {isRendering ? (
               <div className="flex flex-col items-center gap-4">
-                <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden border border-white/5 backdrop-blur-sm">
-                  <div
-                    className="h-full bg-indigo-500 transition-all duration-300"
-                    style={{ width: `${progress}%` }}
-                  />
+                {frameProgress.total > 0 && (
+                  <div className="w-64 space-y-2">
+                    <div className="flex items-center justify-between text-[10px] uppercase tracking-widest font-bold text-slate-300">
+                      <span>{t.frameProgress}</span>
+                      <span>
+                        {frameProgress.current}/{frameProgress.total}
+                      </span>
+                    </div>
+                    <div className="h-2 bg-white/10 rounded-full overflow-hidden border border-white/5 backdrop-blur-sm">
+                      <div
+                        className="h-full bg-indigo-400 transition-all duration-300"
+                        style={{ width: `${framePercent}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+                <div className="w-64 space-y-2">
+                  <div className="flex items-center justify-between text-[10px] uppercase tracking-widest font-bold text-slate-300">
+                    <span>{t.rendering}</span>
+                    <span>{progress}%</span>
+                  </div>
+                  <div className="h-2 bg-white/10 rounded-full overflow-hidden border border-white/5 backdrop-blur-sm">
+                    <div
+                      className="h-full bg-indigo-500 transition-all duration-300"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
                 </div>
                 <button
                   onClick={cancelRendering}
