@@ -1,24 +1,12 @@
 {
-  "name": "react-ts-template",
-  "description": "一套基于react19、ts、vite的项目模板，帮助快速搭建react项目",
+  "name": "momax-tools",
+  "description": "一个将 glb、fbx 转为动作视频的平台",
   "version": "1.0.0",
   "type": "module",
   "packageManager": "pnpm@10.26.0",
-  "author": "huangmingfu <212149997@qq.com>",
+  "author": "alpen",
   "license": "MIT",
-  "homepage": "https://github.com/huangmingfu/react-ts-template",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/huangmingfu/react-ts-template"
-  },
-  "bugs": "https://github.com/huangmingfu/react-ts-template/issues",
-  "keywords": [
-    "react19 ts template",
-    "react template",
-    "react",
-    "template",
-    "vite"
-  ],
+  "private": true,
   "scripts": {
     "dev": "vite -m dev",
     "dev:test": "vite -m test",
@@ -47,11 +35,14 @@
     "clsx": "^2.1.1",
     "dayjs": "^1.11.19",
     "es-toolkit": "^1.43.0",
+    "gif.js.optimized": "1.0.1",
     "immer": "^11.0.1",
+    "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "react-router": "^7.10.1",
     "swr": "^2.3.8",
+    "three": "^0.182.0",
     "use-immer": "^0.11.0",
     "zustand": "^5.0.9"
   },
@@ -66,6 +57,7 @@
     "@types/node": "^25.0.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.182.0",
     "@vitejs/plugin-react-swc": "^4.2.2",
     "eslint": "^9.39.2",
     "eslint-plugin-react-hooks": "^7.0.1",
