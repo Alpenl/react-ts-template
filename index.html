@@ -6,73 +6,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- 动态设置网页标题 -->
     <title>%VITE_APP_TITLE%</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
   </head>
 
   <body>
-    <div id="root">
-      <!-- 白屏阶段会执行的 CSS 加载loading动画 -->
-      <style>
-        .app-loading {
-          position: fixed;
-          top: 50%;
-          left: 50%;
-          transform: translate(-50%, -50%);
-          display: flex;
-          flex-direction: column;
-          justify-content: center;
-          align-items: center;
-        }
-        .app-loading .app-loading-title {
-          color: #269af2;
-        }
-        .app-loading .app-loading-loader {
-          --r1: 154%;
-          --r2: 68.5%;
-
-          width: 80px;
-          background:
-            radial-gradient(var(--r1) var(--r2) at top, #0000 79.5%, #269af2 80%),
-            radial-gradient(var(--r1) var(--r2) at bottom, #269af2 79.5%, #0000 80%),
-            radial-gradient(var(--r1) var(--r2) at top, #0000 79.5%, #269af2 80%), #ccc;
-          background-position:
-            -100% 0%,
-            0% 0%,
-            100% 0%;
-          background-repeat: no-repeat;
-          background-size: 50.5% 220%;
-          border-radius: 50%;
-          animation: l9 2s infinite linear;
-          aspect-ratio: 1;
-        }
-
-        @keyframes l9 {
-          33% {
-            background-position:
-              0% 33%,
-              100% 33%,
-              200% 33%;
-          }
-
-          66% {
-            background-position:
-              -100% 66%,
-              0% 66%,
-              100% 66%;
-          }
-
-          100% {
-            background-position:
-              0% 100%,
-              100% 100%,
-              200% 100%;
-          }
-        }
-      </style>
-      <div class="app-loading">
-        <div class="app-loading-loader"></div>
-        <h3 class="app-loading-title">%VITE_APP_TITLE%</h3>
-      </div>
-    </div>
+    <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
