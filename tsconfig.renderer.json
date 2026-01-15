@@ -3,16 +3,14 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "Node",
-    "lib": ["ESNext", "DOM"],
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "declaration": true,
-    "declarationMap": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "outDir": "./public/renderer",
+    "rootDir": "./src/renderer",
+    "declaration": false,
     "sourceMap": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true,
     "isolatedModules": true,
 
     /* 严格模式 */
@@ -20,14 +18,8 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noImplicitReturns": true,
-
-    /* 路径别名 */
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["./src/*"]
-    }
+    "noImplicitReturns": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "public", "src/renderer/**/*"]
+  "include": ["src/renderer/**/*.ts"],
+  "exclude": ["node_modules"]
 }

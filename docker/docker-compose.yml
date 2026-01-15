@@ -1,0 +1,80 @@
+# 3D 模型渲染服务 Docker Compose 配置
+#
+# 使用方法:
+#   启动服务: docker-compose up -d
+#   查看日志: docker-compose logs -f
+#   停止服务: docker-compose down
+
+version: '3.8'
+
+services:
+  # 渲染服务
+  render-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: momax-render-service
+    restart: unless-stopped
+
+    # 环境变量
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      # RabbitMQ 配置 (后续使用)
+      # - RABBITMQ_URL=amqp://rabbitmq:5672
+      # OSS 配置 (后续使用)
+      # - OSS_ENDPOINT=
+      # - OSS_ACCESS_KEY=
+      # - OSS_SECRET_KEY=
+      # - OSS_BUCKET=
+
+    # 挂载卷
+    volumes:
+      # 上传文件目录
+      - ../uploads:/app/uploads
+      # 输出文件目录
+      - ../outputs:/app/outputs
+      # 临时文件目录 (可选，用于调试)
+      # - ../temp:/app/temp
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+    # 共享内存大小 (Chromium 需要)
+    shm_size: '2gb'
+
+    # 安全选项
+    security_opt:
+      - no-new-privileges:true
+
+    # 日志配置
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # RabbitMQ (后续使用)
+  # rabbitmq:
+  #   image: rabbitmq:3-management-alpine
+  #   container_name: momax-rabbitmq
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5672:5672"
+  #     - "15672:15672"
+  #   environment:
+  #     - RABBITMQ_DEFAULT_USER=admin
+  #     - RABBITMQ_DEFAULT_PASS=admin
+  #   volumes:
+  #     - rabbitmq_data:/var/lib/rabbitmq
+
+# 数据卷
+# volumes:
+#   rabbitmq_data:

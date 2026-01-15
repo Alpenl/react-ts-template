@@ -1,2 +1,0 @@
-# pnpm run lint:all 全量检查，耗时多
-npx lint-staged # 只检查暂存的文件
