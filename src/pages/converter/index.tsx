@@ -176,14 +176,15 @@ const gifWorkerUrl = new URL('gif.js.optimized/dist/gif.worker.js', import.meta.
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 const getCropRectForAspect = (
-  rect: { x: number; y: number; width: number; height: number },
+  _rect: { x: number; y: number; width: number; height: number },
   aspect: number,
   viewWidth: number,
   viewHeight: number,
 ) => {
-  if (!Number.isFinite(aspect) || aspect <= 0) return rect;
-  if (!Number.isFinite(viewWidth) || !Number.isFinite(viewHeight)) return rect;
-  if (viewWidth <= 0 || viewHeight <= 0) return rect;
+  const defaultRect = { x: 0, y: 0, width: 1, height: 1 };
+  if (!Number.isFinite(aspect) || aspect <= 0) return defaultRect;
+  if (!Number.isFinite(viewWidth) || !Number.isFinite(viewHeight)) return defaultRect;
+  if (viewWidth <= 0 || viewHeight <= 0) return defaultRect;
   const viewAspect = viewWidth / viewHeight;
   let width = 1;
   let height = 1;
@@ -192,10 +193,9 @@ const getCropRectForAspect = (
   } else {
     width = aspect / viewAspect;
   }
-  const centerX = rect.x + rect.width / 2;
-  const centerY = rect.y + rect.height / 2;
-  const nextX = clamp(centerX - width / 2, 0, 1 - width);
-  const nextY = clamp(centerY - height / 2, 0, 1 - height);
+  // Always center the crop rectangle to ensure the model stays in the center
+  const nextX = (1 - width) / 2;
+  const nextY = (1 - height) / 2;
   return { x: nextX, y: nextY, width, height };
 };
 
@@ -489,6 +489,9 @@ const Converter: React.FC = () => {
     if (!drag || drag.pointerId !== event.pointerId) return;
     cropDragRef.current = null;
     event.currentTarget.releasePointerCapture(event.pointerId);
+    // Always reset to center to ensure the model stays in the center of the exported video
+    const currentConfig = renderConfigRef.current;
+    syncCropRectForConfig(currentConfig.width, currentConfig.height);
   };
 
   // Sync scene state to Three.js objects
