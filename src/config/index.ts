@@ -66,6 +66,10 @@ export const DEFAULT_RENDER_CONFIG = {
 
 /**
  * Puppeteer 配置
+ *
+ * 注意：GPU 加速需要系统有 /dev/dri 设备（GPU 直通）
+ * - 有 GPU 时：使用 --use-gl=egl 或 --use-gl=desktop
+ * - 无 GPU 时：使用 --use-gl=swiftshader（软件渲染）
  */
 export const PUPPETEER_CONFIG = {
   /** 是否使用 headless 模式 */
@@ -75,8 +79,10 @@ export const PUPPETEER_CONFIG = {
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--use-gl=swiftshader', // 使用软件渲染
+    // WebGL 配置（自动检测 GPU，无 GPU 时回退到 SwiftShader）
+    '--enable-webgl',
+    '--enable-webgl2',
+    // 安全配置
     '--disable-web-security',
     '--allow-file-access-from-files',
   ],
