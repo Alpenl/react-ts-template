@@ -66,8 +66,8 @@ export class FFmpegService {
   ): Promise<void> {
     logger.info('开始视频编码', { framesDir, outputPath, config });
 
-    // 帧文件模式
-    const inputPattern = path.join(framesDir, 'frame_%06d.png');
+    // 帧文件模式（支持 jpg 和 png）
+    const inputPattern = path.join(framesDir, 'frame_%06d.jpg');
 
     // 确保输出目录存在
     const outputDir = path.dirname(outputPath);

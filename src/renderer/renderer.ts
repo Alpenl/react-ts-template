@@ -416,6 +416,95 @@ class ModelRenderer {
   }
 
   /**
+   * 批量渲染多帧并返回 base64 数据
+   * 优化版本：使用 toBlob 异步 API
+   *
+   * @param times - 时间点数组
+   * @param format - 图像格式 ('image/jpeg' | 'image/png')
+   * @param quality - JPEG 质量 (0-1)
+   * @returns base64 编码的图像数据数组
+   */
+  async renderFramesBatchAsync(times: number[], format = 'image/jpeg', quality = 0.92): Promise<string[]> {
+    const results: string[] = [];
+    const canvas = this.renderer.domElement;
+
+    for (const time of times) {
+      // 更新动画
+      if (this.mixer) {
+        this.mixer.setTime(time);
+      }
+
+      // 更新骨骼辅助线
+      if (this.skeletonHelper) {
+        this.skeletonHelper.updateMatrixWorld(true);
+      }
+
+      // 更新骨骼连接线
+      if (this.rigHelper) {
+        updateRigHelper(this.rigHelper);
+      }
+
+      // 渲染场景
+      this.renderer.render(this.scene, this.camera);
+
+      // 使用 toBlob 异步获取图像数据（比 toDataURL 更高效）
+      const blob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob((b) => resolve(b!), format, quality);
+      });
+
+      // 转换为 base64
+      const arrayBuffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      results.push(btoa(binary));
+    }
+
+    return results;
+  }
+
+  /**
+   * 批量渲染多帧并返回 base64 数据（同步版本）
+   *
+   * @param times - 时间点数组
+   * @param format - 图像格式 ('image/jpeg' | 'image/png')
+   * @param quality - JPEG 质量 (0-1)
+   * @returns base64 编码的图像数据数组
+   */
+  renderFramesBatch(times: number[], format = 'image/jpeg', quality = 0.92): string[] {
+    const results: string[] = [];
+    const canvas = this.renderer.domElement;
+
+    for (const time of times) {
+      // 更新动画
+      if (this.mixer) {
+        this.mixer.setTime(time);
+      }
+
+      // 更新骨骼辅助线
+      if (this.skeletonHelper) {
+        this.skeletonHelper.updateMatrixWorld(true);
+      }
+
+      // 更新骨骼连接线
+      if (this.rigHelper) {
+        updateRigHelper(this.rigHelper);
+      }
+
+      // 渲染场景
+      this.renderer.render(this.scene, this.camera);
+
+      // 获取图像数据
+      const dataUrl = canvas.toDataURL(format, quality);
+      results.push(dataUrl.split(',')[1]);
+    }
+
+    return results;
+  }
+
+  /**
    * 获取动画时长
    *
    * @returns 动画时长（秒）

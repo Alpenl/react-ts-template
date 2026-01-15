@@ -38573,6 +38573,69 @@ var ModelRenderer = class {
     this.renderer.render(this.scene, this.camera);
   }
   /**
+   * 批量渲染多帧并返回 base64 数据
+   * 优化版本：使用 toBlob 异步 API
+   *
+   * @param times - 时间点数组
+   * @param format - 图像格式 ('image/jpeg' | 'image/png')
+   * @param quality - JPEG 质量 (0-1)
+   * @returns base64 编码的图像数据数组
+   */
+  async renderFramesBatchAsync(times, format = "image/jpeg", quality = 0.92) {
+    const results = [];
+    const canvas = this.renderer.domElement;
+    for (const time of times) {
+      if (this.mixer) {
+        this.mixer.setTime(time);
+      }
+      if (this.skeletonHelper) {
+        this.skeletonHelper.updateMatrixWorld(true);
+      }
+      if (this.rigHelper) {
+        updateRigHelper(this.rigHelper);
+      }
+      this.renderer.render(this.scene, this.camera);
+      const blob = await new Promise((resolve) => {
+        canvas.toBlob((b) => resolve(b), format, quality);
+      });
+      const arrayBuffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      results.push(btoa(binary));
+    }
+    return results;
+  }
+  /**
+   * 批量渲染多帧并返回 base64 数据（同步版本）
+   *
+   * @param times - 时间点数组
+   * @param format - 图像格式 ('image/jpeg' | 'image/png')
+   * @param quality - JPEG 质量 (0-1)
+   * @returns base64 编码的图像数据数组
+   */
+  renderFramesBatch(times, format = "image/jpeg", quality = 0.92) {
+    const results = [];
+    const canvas = this.renderer.domElement;
+    for (const time of times) {
+      if (this.mixer) {
+        this.mixer.setTime(time);
+      }
+      if (this.skeletonHelper) {
+        this.skeletonHelper.updateMatrixWorld(true);
+      }
+      if (this.rigHelper) {
+        updateRigHelper(this.rigHelper);
+      }
+      this.renderer.render(this.scene, this.camera);
+      const dataUrl = canvas.toDataURL(format, quality);
+      results.push(dataUrl.split(",")[1]);
+    }
+    return results;
+  }
+  /**
    * 获取动画时长
    *
    * @returns 动画时长（秒）

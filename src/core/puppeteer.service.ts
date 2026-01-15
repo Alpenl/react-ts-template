@@ -199,66 +199,50 @@ export class PuppeteerService {
 
       // 预渲染几帧，确保材质和光照完全加载
       logger.debug('预渲染场景...');
-      for (let i = 0; i < 3; i++) {
-        await page.evaluate((t: number) => {
-          if (window.__renderer) {
-            window.__renderer.renderFrame(t);
+      await page.evaluate(() => {
+        if (window.__renderer) {
+          // 预渲染 3 帧
+          for (let i = 0; i < 3; i++) {
+            window.__renderer.renderFrame(0);
           }
-        }, 0);
-        // 等待一小段时间让 GPU 完成渲染
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      });
+      // 等待 GPU 完成
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // 计算所有帧的时间点
+      const allFrameTimes: number[] = [];
+      for (let i = 0; i < totalFrames; i++) {
+        const elapsed = i * frameTime * config.animationSpeed;
+        const time = animationDuration > 0 ? elapsed % animationDuration : 0;
+        allFrameTimes.push(time);
       }
 
-      // 逐帧渲染和捕获（优化版：使用 canvas.toDataURL 替代 page.screenshot）
+      // 一次性在浏览器中渲染所有帧（使用同步批量渲染方法）
+      logger.debug('开始批量渲染帧...');
+      const frameDataArray = await page.evaluate((times: number[]) => {
+        if (window.__renderer) {
+          return window.__renderer.renderFramesBatch(times, 'image/jpeg', 0.92);
+        }
+        return [];
+      }, allFrameTimes);
+
+      // 报告渲染完成
+      if (onProgress) {
+        onProgress(totalFrames, totalFrames);
+      }
+
+      // 并行写入所有帧文件
+      logger.debug('写入帧文件...');
       const frames: string[] = [];
-      const BATCH_SIZE = 10; // 每批处理的帧数
+      const writePromises = frameDataArray.map((data, i) => {
+        const framePath = path.join(framesDir, `frame_${String(i).padStart(6, '0')}.jpg`);
+        frames.push(framePath);
+        const buffer = Buffer.from(data, 'base64');
+        return fs.writeFile(framePath, buffer);
+      });
 
-      for (let batchStart = 0; batchStart < totalFrames; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, totalFrames);
-        const batchFrameCount = batchEnd - batchStart;
-
-        // 计算这一批帧的时间点
-        const frameTimes: number[] = [];
-        for (let i = batchStart; i < batchEnd; i++) {
-          const elapsed = i * frameTime * config.animationSpeed;
-          const time = animationDuration > 0 ? elapsed % animationDuration : 0;
-          frameTimes.push(time);
-        }
-
-        // 在浏览器中批量渲染并获取帧数据
-        const frameDataArray = await page.evaluate((times: number[]) => {
-          const results: string[] = [];
-          for (const t of times) {
-            if (window.__renderer) {
-              window.__renderer.renderFrame(t);
-              // 直接从 canvas 获取图像数据（比 screenshot 快很多）
-              const canvas = window.__renderer.getCanvas();
-              // 使用 PNG 格式保证质量
-              const dataUrl = canvas.toDataURL('image/png');
-              // 去掉 data:image/png;base64, 前缀
-              results.push(dataUrl.split(',')[1]);
-            }
-          }
-          return results;
-        }, frameTimes);
-
-        // 将 base64 数据写入文件
-        for (let j = 0; j < frameDataArray.length; j++) {
-          const frameIndex = batchStart + j;
-          const framePath = path.join(framesDir, `frame_${String(frameIndex).padStart(6, '0')}.png`);
-          const buffer = Buffer.from(frameDataArray[j], 'base64');
-          await fs.writeFile(framePath, buffer);
-          frames.push(framePath);
-
-          // 报告进度
-          if (onProgress) {
-            onProgress(frameIndex + 1, totalFrames);
-          }
-        }
-
-        // 每批输出一次日志
-        logger.debug(`帧捕获进度: ${batchEnd}/${totalFrames}`);
-      }
+      await Promise.all(writePromises);
 
       logger.info('帧捕获完成', { totalFrames: frames.length });
 
