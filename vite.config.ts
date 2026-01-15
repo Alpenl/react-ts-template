@@ -8,6 +8,7 @@ import checker from 'vite-plugin-checker';
 export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
   // 获取`.env`环境配置文件
   const env = loadEnv(mode, process.cwd());
+  const appTitle = env.VITE_APP_TITLE || 'momaxTools';
   return {
     base: env.VITE_NODE_ENV === 'development' ? './' : '/', // 此配置仅为github pages部署用，请自行修改或删除（一般情况下直接移除就行）
     plugins: [
@@ -25,6 +26,12 @@ export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
           lintCommand: 'eslint "./src/**/*.{ts,tsx}"',
         },
       }),
+      {
+        name: 'html-app-title',
+        transformIndexHtml(html) {
+          return html.replace(/%VITE_APP_TITLE%/g, appTitle);
+        },
+      },
     ],
     resolve: {
       alias: {

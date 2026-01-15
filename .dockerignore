@@ -1,0 +1,55 @@
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+dist-*
+
+# Version control
+.git
+.github
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files
+.env
+.env.dev
+.env.test
+.env.local
+.env.*.local
+
+# Test and coverage
+coverage
+.nyc_output
+
+# Documentation
+*.md
+LICENSE
+
+# Assets (large files not needed for build)
+assets
+
+# Docker files (not needed inside container)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Scripts
+scripts
+
+# Misc
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp

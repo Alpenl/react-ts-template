@@ -9,6 +9,13 @@ export interface ModelMetadata {
   boneCount: number;
 }
 
+export interface ExampleItem {
+  id: number;
+  label: number;
+  fbxUrl: string;
+  videoUrl: string;
+}
+
 export interface SceneConfig {
   cameraPosition: { x: number; y: number; z: number };
   lookAt: { x: number; y: number; z: number };
@@ -21,17 +28,5 @@ export interface SceneConfig {
   backgroundColor: string;
   exposure: number;
   shadowsEnabled: boolean;
-  animationSpeed: number;
   fov: number;
-}
-
-export interface RenderingConfig {
-  fps: number;
-  width: number;
-  height: number;
-  bitrate: number;
-  format: 'webm' | 'mp4' | 'gif';
-  duration: number;
-  gifQuality: number;
-  viewMode: 'fit' | 'current';
 }

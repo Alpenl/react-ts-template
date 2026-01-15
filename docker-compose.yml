@@ -1,0 +1,10 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_MODE: pro
+        OUTPUT_DIR: dist-pro
+    ports:
+      - "8080:80"

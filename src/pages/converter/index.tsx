@@ -1,29 +1,316 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 
-import GIF from 'gif.js.optimized';
 import {
   Activity,
+  Axis3d,
   Box,
-  Download,
   FileCode,
+  FolderOpen,
   Languages,
   Layers,
   Loader2,
   Palette,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pause,
   Play,
-  Square,
   Sun,
   Upload,
-  Video,
-  Zap,
 } from 'lucide-react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import { Locale, translations } from './locales';
-import { ModelMetadata, RenderingConfig, SceneConfig } from './types';
+import { ExampleItem, ModelMetadata, SceneConfig } from './types';
+
+const OSS_BASE_URL = 'https://momax-test2.oss-cn-beijing.aliyuncs.com/examples';
+
+const EXAMPLE_OSS_IDS = [1, 3, 4, 6, 7, 8];
+const EXAMPLES: ExampleItem[] = EXAMPLE_OSS_IDS.map((ossId, index) => ({
+  id: index + 1,
+  label: index + 1,
+  fbxUrl: `${OSS_BASE_URL}/${ossId}/示例${ossId}.fbx`,
+  videoUrl: `${OSS_BASE_URL}/${ossId}/示例${ossId}.mp4`,
+}));
+const EXAMPLE_STEP_TARGETS: Record<number, number> = {
+  1: 5,
+  2: 6,
+  3: 0,
+  4: 4,
+  5: 5.5,
+  6: 4.5,
+};
+
+const motionBoneTokens = ['hips', 'hip', 'pelvis', 'root', 'center', 'master'];
+const footBoneTokens = ['foot', 'toe', 'ankle', 'ball'];
+const leftBoneTokens = ['left', 'l_', 'l-', '_l', '.l', 'l.'];
+const rightBoneTokens = ['right', 'r_', 'r-', '_r', '.r', 'r.'];
+const initialMotionStats = {
+  speed: 0,
+  stepCount: 0,
+  leftFootHeight: null as number | null,
+  rightFootHeight: null as number | null,
+  axisDelta: { x: 0, y: 0, z: 0 },
+  frameIndex: 0,
+  elapsed: 0,
+};
+const animationStep = 1 / 30;
+const cmToMeter = 0.01;
+const footContactThresholdRatio = 0.15; // 15% from min height is considered ground contact
+const minFootLiftRange = 5; // cm, ignore micro jitter
+const footLiftThresholdRatio = 0.1; // 10% above min height to mark a lift
+const footContactSlack = 0.5; // cm, tolerate small height jitter around ground
+const minStepInterval = 0.2; // s, suppress duplicate counts for a single contact
+const loopTimeEpsilon = 1e-4; // s, avoid false loop detection due to float jitter
+const chartWindow = 80;
+const chartWidth = 260;
+const chartHeight = 72;
+
+const collectBones = (root: THREE.Object3D) => {
+  const bones: THREE.Bone[] = [];
+  root.traverse((child) => {
+    if ((child as THREE.Bone).isBone) bones.push(child as THREE.Bone);
+  });
+  return bones;
+};
+
+const pickMotionBone = (bones: THREE.Bone[]) => {
+  if (bones.length === 0) return null;
+  const match = bones.find((bone) => {
+    const name = bone.name.toLowerCase();
+    return motionBoneTokens.some((token) => name.includes(token));
+  });
+  return match ?? bones[0];
+};
+
+const pickFootBones = (bones: THREE.Bone[]) => {
+  if (bones.length === 0) return [];
+  const matches = bones.filter((bone) => {
+    const name = bone.name.toLowerCase();
+    return footBoneTokens.some((token) => name.includes(token));
+  });
+  return matches.length > 0 ? matches : bones;
+};
+
+const splitFootBones = (bones: THREE.Bone[]) => {
+  const left: THREE.Bone[] = [];
+  const right: THREE.Bone[] = [];
+  for (const bone of bones) {
+    const name = bone.name.toLowerCase();
+    if (leftBoneTokens.some((token) => name.includes(token))) {
+      left.push(bone);
+    } else if (rightBoneTokens.some((token) => name.includes(token))) {
+      right.push(bone);
+    }
+  }
+  return { left, right };
+};
+
+const splitFootBonesByAxis = (root: THREE.Object3D, bones: THREE.Bone[]) => {
+  const left: THREE.Bone[] = [];
+  const right: THREE.Bone[] = [];
+  const worldPos = new THREE.Vector3();
+
+  root.updateMatrixWorld(true);
+  for (const bone of bones) {
+    bone.getWorldPosition(worldPos);
+    if (worldPos.x <= 0) {
+      left.push(bone);
+    } else {
+      right.push(bone);
+    }
+  }
+
+  return { left, right };
+};
+
+const resolveFootSides = (root: THREE.Object3D, footBones: THREE.Bone[]) => {
+  const named = splitFootBones(footBones);
+  if (named.left.length > 0 && named.right.length > 0) return named;
+  if (footBones.length === 0) return named;
+  return splitFootBonesByAxis(root, footBones);
+};
+
+// Pre-analyze animation to calculate dynamic foot thresholds
+const analyzeFootThresholds = (
+  root: THREE.Object3D,
+  mixer: THREE.AnimationMixer,
+  action: THREE.AnimationAction,
+  footBones: THREE.Bone[],
+  leftFootBones: THREE.Bone[],
+  rightFootBones: THREE.Bone[],
+) => {
+  const clip = action.getClip();
+  const duration = clip.duration;
+  const sampleRate = 30;
+  const totalSamples = Math.ceil(duration * sampleRate);
+
+  const leftYValues: number[] = [];
+  const rightYValues: number[] = [];
+  const worldPos = new THREE.Vector3();
+  const allFootBones = footBones.length > 0 ? footBones : [...leftFootBones, ...rightFootBones];
+
+  if (allFootBones.length === 0) {
+    return {
+      leftThreshold: 0,
+      rightThreshold: 0,
+      leftRange: 0,
+      rightRange: 0,
+    };
+  }
+
+  // Sample the animation
+  for (let i = 0; i <= totalSamples; i++) {
+    const time = i / sampleRate;
+    mixer.setTime(time);
+    root.updateMatrixWorld(true);
+
+    let groundY = Infinity;
+    for (const bone of allFootBones) {
+      bone.getWorldPosition(worldPos);
+      groundY = Math.min(groundY, worldPos.y);
+    }
+    if (!Number.isFinite(groundY)) groundY = 0;
+
+    // Get left foot Y
+    if (leftFootBones.length > 0) {
+      let minY = Infinity;
+      for (const bone of leftFootBones) {
+        bone.getWorldPosition(worldPos);
+        minY = Math.min(minY, worldPos.y);
+      }
+      if (Number.isFinite(minY)) leftYValues.push(minY - groundY);
+    }
+
+    // Get right foot Y
+    if (rightFootBones.length > 0) {
+      let minY = Infinity;
+      for (const bone of rightFootBones) {
+        bone.getWorldPosition(worldPos);
+        minY = Math.min(minY, worldPos.y);
+      }
+      if (Number.isFinite(minY)) rightYValues.push(minY - groundY);
+    }
+  }
+
+  // Reset mixer to start
+  mixer.setTime(0);
+
+  // Calculate thresholds (15% from min height)
+  const calcThreshold = (values: number[]) => {
+    if (values.length === 0) return { threshold: 0, range: 0 };
+    const minY = Math.min(...values);
+    const maxY = Math.max(...values);
+    const range = maxY - minY;
+    if (!Number.isFinite(range) || range < minFootLiftRange) {
+      return { threshold: minY, range: 0 };
+    }
+    return { threshold: minY + range * footContactThresholdRatio, range };
+  };
+
+  const leftStats = calcThreshold(leftYValues);
+  const rightStats = calcThreshold(rightYValues);
+
+  return {
+    leftThreshold: leftStats.threshold,
+    rightThreshold: rightStats.threshold,
+    leftRange: leftStats.range,
+    rightRange: rightStats.range,
+  };
+};
+
+const calcLiftThreshold = (threshold: number, range: number) => {
+  if (!Number.isFinite(range) || range <= 0) return threshold;
+  const min = threshold - range * footContactThresholdRatio;
+  return min + range * footLiftThresholdRatio;
+};
+
+const estimateStepCount = (
+  root: THREE.Object3D,
+  mixer: THREE.AnimationMixer,
+  action: THREE.AnimationAction,
+  footBones: THREE.Bone[],
+  leftFootBones: THREE.Bone[],
+  rightFootBones: THREE.Bone[],
+  thresholds: {
+    leftThreshold: number;
+    rightThreshold: number;
+    leftRange: number;
+    rightRange: number;
+  },
+) => {
+  const clip = action.getClip();
+  const duration = clip.duration;
+  const sampleRate = 30;
+  const totalSamples = Math.ceil(duration * sampleRate);
+  const allFootBones = footBones.length > 0 ? footBones : [...leftFootBones, ...rightFootBones];
+  if (allFootBones.length === 0) return 0;
+
+  const worldPos = new THREE.Vector3();
+  const leftLiftThreshold = calcLiftThreshold(thresholds.leftThreshold, thresholds.leftRange);
+  const rightLiftThreshold = calcLiftThreshold(thresholds.rightThreshold, thresholds.rightRange);
+  let rawSteps = 0;
+  let leftWasAbove = false;
+  let rightWasAbove = false;
+  let lastLeftStepTime = -Infinity;
+  let lastRightStepTime = -Infinity;
+
+  for (let i = 0; i <= totalSamples; i += 1) {
+    const time = i / sampleRate;
+    mixer.setTime(time);
+    root.updateMatrixWorld(true);
+
+    let groundY = Infinity;
+    let leftMin = Infinity;
+    let rightMin = Infinity;
+
+    for (const bone of allFootBones) {
+      bone.getWorldPosition(worldPos);
+      groundY = Math.min(groundY, worldPos.y);
+    }
+    if (!Number.isFinite(groundY)) groundY = 0;
+
+    if (leftFootBones.length > 0) {
+      for (const bone of leftFootBones) {
+        bone.getWorldPosition(worldPos);
+        leftMin = Math.min(leftMin, worldPos.y);
+      }
+    }
+    if (rightFootBones.length > 0) {
+      for (const bone of rightFootBones) {
+        bone.getWorldPosition(worldPos);
+        rightMin = Math.min(rightMin, worldPos.y);
+      }
+    }
+
+    const leftRelativeHeight = Number.isFinite(leftMin) ? leftMin - groundY : null;
+    const rightRelativeHeight = Number.isFinite(rightMin) ? rightMin - groundY : null;
+    const leftAbove =
+      thresholds.leftRange >= minFootLiftRange &&
+      leftRelativeHeight !== null &&
+      leftRelativeHeight >= leftLiftThreshold;
+    const rightAbove =
+      thresholds.rightRange >= minFootLiftRange &&
+      rightRelativeHeight !== null &&
+      rightRelativeHeight >= rightLiftThreshold;
+
+    if (!leftWasAbove && leftAbove && time - lastLeftStepTime >= minStepInterval) {
+      rawSteps += 0.5;
+      lastLeftStepTime = time;
+    }
+    if (!rightWasAbove && rightAbove && time - lastRightStepTime >= minStepInterval) {
+      rawSteps += 0.5;
+      lastRightStepTime = time;
+    }
+
+    leftWasAbove = leftAbove;
+    rightWasAbove = rightAbove;
+  }
+
+  mixer.setTime(0);
+  return rawSteps;
+};
 
 const needsPreciseBounds = (model: THREE.Object3D) => {
   let precise = false;
@@ -127,6 +414,34 @@ const updateRigHelper = (rig: RigHelper) => {
   position.needsUpdate = true;
 };
 
+const buildSparklinePath = (values: number[], width: number, height: number) => {
+  if (values.length === 0) {
+    return { line: '', area: '', last: null as { x: number; y: number } | null };
+  }
+  const safeValues = values.map((value) => (Number.isFinite(value) ? value : 0));
+  const min = Math.min(...safeValues);
+  const max = Math.max(...safeValues);
+  const range = max - min;
+  const pad = 6;
+  const innerWidth = Math.max(width - pad * 2, 1);
+  const innerHeight = Math.max(height - pad * 2, 1);
+  const step = safeValues.length > 1 ? innerWidth / (safeValues.length - 1) : 0;
+  const points = safeValues.map((value, index) => {
+    const ratio = range === 0 ? 0.5 : (value - min) / range;
+    const x = pad + index * step;
+    const y = pad + (1 - ratio) * innerHeight;
+    return { x, y };
+  });
+  const line = points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(2)},${point.y.toFixed(2)}`)
+    .join(' ');
+  const baselineY = pad + innerHeight;
+  const area = `${line} L ${points[points.length - 1].x.toFixed(2)},${baselineY.toFixed(
+    2,
+  )} L ${points[0].x.toFixed(2)},${baselineY.toFixed(2)} Z`;
+  return { line, area, last: points[points.length - 1] };
+};
+
 const alignRootToGround = (root: THREE.Object3D, targetSize = 250, precise = false) => {
   root.updateMatrixWorld(true);
   const box = getObjectBounds(root, precise);
@@ -144,86 +459,6 @@ const alignRootToGround = (root: THREE.Object3D, targetSize = 250, precise = fal
   root.position.set(-center.x, -scaledBox.min.y, -center.z);
   root.updateMatrixWorld(true);
 };
-
-const getSupportedMimeType = (candidates: string[]) => {
-  if (typeof MediaRecorder === 'undefined') return '';
-  for (const candidate of candidates) {
-    if (MediaRecorder.isTypeSupported(candidate)) return candidate;
-  }
-  return '';
-};
-
-const getRecordingOptions = (format: 'webm' | 'mp4') => {
-  const mp4Candidates = ['video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=h264', 'video/mp4'];
-  const webmCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
-  if (format === 'mp4') {
-    const mimeType = getSupportedMimeType(mp4Candidates);
-    if (mimeType) {
-      return { mimeType, format: 'mp4' as const, notice: false };
-    }
-    const fallbackMime = getSupportedMimeType(webmCandidates);
-    return {
-      mimeType: fallbackMime,
-      format: 'webm' as const,
-      notice: true,
-    };
-  }
-  return { mimeType: getSupportedMimeType(webmCandidates), format: 'webm' as const, notice: false };
-};
-
-const gifWorkerUrl = new URL('gif.js.optimized/dist/gif.worker.js', import.meta.url).toString();
-
-const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
-
-const getCropRectForAspect = (
-  rect: { x: number; y: number; width: number; height: number },
-  aspect: number,
-  viewWidth: number,
-  viewHeight: number,
-) => {
-  if (!Number.isFinite(aspect) || aspect <= 0) return rect;
-  if (!Number.isFinite(viewWidth) || !Number.isFinite(viewHeight)) return rect;
-  if (viewWidth <= 0 || viewHeight <= 0) return rect;
-  const viewAspect = viewWidth / viewHeight;
-  let width = 1;
-  let height = 1;
-  if (aspect > viewAspect) {
-    height = viewAspect / aspect;
-  } else {
-    width = aspect / viewAspect;
-  }
-  const centerX = rect.x + rect.width / 2;
-  const centerY = rect.y + rect.height / 2;
-  const nextX = clamp(centerX - width / 2, 0, 1 - width);
-  const nextY = clamp(centerY - height / 2, 0, 1 - height);
-  return { x: nextX, y: nextY, width, height };
-};
-
-const getClipFrameCount = (clip: THREE.AnimationClip | null) => {
-  if (!clip) return 0;
-  let maxFrames = 0;
-  for (const track of clip.tracks) {
-    const count = track.times.length;
-    if (count > maxFrames) maxFrames = count;
-  }
-  if (maxFrames > 0) return maxFrames;
-  if (Number.isFinite(clip.duration) && clip.duration > 0)
-    return Math.max(1, Math.round(clip.duration * 60));
-  return 0;
-};
-
-const resolutionPresets = [
-  { label: '720p (HD)', width: 1280, height: 720 },
-  { label: '1080p (FHD)', width: 1920, height: 1080 },
-  { label: '1440p (QHD)', width: 2560, height: 1440 },
-  { label: '2160p (4K)', width: 3840, height: 2160 },
-];
-
-const aspectPresets = [
-  { label: '1:1', width: 1, height: 1 },
-  { label: '4:3', width: 4, height: 3 },
-  { label: '9:16', width: 9, height: 16 },
-];
 
 const viewPreset = {
   cameraPosition: new THREE.Vector3(-533.2114976476801, 130.61937589294004, 629.7917070129056),
@@ -295,19 +530,34 @@ const applyViewForModel = (
 };
 
 const Converter: React.FC = () => {
-  const [lang, setLang] = useState<Locale>('zh');
+  const [lang, setLang] = useState<Locale>('en');
   const t = translations[lang];
 
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
-  const [isRendering, setIsRendering] = useState(false);
   const [metadata, setMetadata] = useState<ModelMetadata | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [videoFormat, setVideoFormat] = useState<'webm' | 'mp4' | 'gif'>('webm');
-  const [renderNotice, setRenderNotice] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [frameProgress, setFrameProgress] = useState({ current: 0, total: 0 });
-  const [activeTab, setActiveTab] = useState<'info' | 'settings' | 'export'>('info');
+  const [motionStats, dispatchMotionStats] = useReducer(
+    (_: typeof initialMotionStats, next: typeof initialMotionStats) => next,
+    initialMotionStats,
+  );
+  const [activeTab, setActiveTab] = useState<'info' | 'settings'>('info');
+  const [isPaused, setIsPaused] = useState(false);
+  const [isSidebarVisible, setIsSidebarVisible] = useState(true);
+  const [currentVideoUrl, setCurrentVideoUrl] = useState<string | null>(null);
+  const [selectedExampleId, setSelectedExampleId] = useState<number | null>(null);
+  const [chartSeries, dispatchChartSeries] = useReducer(
+    (
+      state: { speed: number[]; stepRate: number[] },
+      updater: (prev: { speed: number[]; stepRate: number[] }) => {
+        speed: number[];
+        stepRate: number[];
+      },
+    ) => updater(state),
+    {
+      speed: [],
+      stepRate: [],
+    },
+  );
 
   const [sceneParams, setSceneParams] = useState<SceneConfig>({
     cameraPosition: { x: 300, y: 200, z: 300 },
@@ -321,59 +571,84 @@ const Converter: React.FC = () => {
     backgroundColor: '#020617',
     exposure: 1.5,
     shadowsEnabled: true,
-    animationSpeed: 1.0,
     fov: 45,
   });
 
-  const [renderConfig, setRenderConfig] = useState<RenderingConfig>({
-    fps: 60,
-    width: 1920,
-    height: 1080,
-    bitrate: 20000000,
-    format: 'mp4',
-    duration: 5,
-    gifQuality: 10,
-    viewMode: 'fit',
-  });
-
-  const [resolutionMode, setResolutionMode] = useState<'preset' | 'custom'>('preset');
-  const [cropRect, setCropRect] = useState({ x: 0, y: 0, width: 1, height: 1 });
-  const renderConfigRef = useRef(renderConfig);
-  const viewportSizeRef = useRef({ width: 1, height: 1 });
-
-  const presetMatch = resolutionPresets.find(
-    (preset) => preset.width === renderConfig.width && preset.height === renderConfig.height,
-  );
-  const resolutionValue =
-    resolutionMode === 'custom' || !presetMatch
-      ? 'custom'
-      : `${renderConfig.width}x${renderConfig.height}`;
-
-  const toDimension = (value: string | number, fallback: number) => {
-    const parsed = typeof value === 'string' ? Number(value) : value;
-    if (!Number.isFinite(parsed)) return fallback;
-    return Math.max(16, Math.round(parsed));
-  };
-
-  const applyAspectPreset = (preset: { width: number; height: number }) => {
-    const base = Math.max(renderConfig.width, renderConfig.height);
-    const isLandscape = preset.width >= preset.height;
-    const targetWidth = isLandscape ? base : Math.round((base * preset.width) / preset.height);
-    const targetHeight = isLandscape ? Math.round((base * preset.height) / preset.width) : base;
-    const nextWidth = toDimension(targetWidth, renderConfig.width);
-    const nextHeight = toDimension(targetHeight, renderConfig.height);
-    setResolutionMode('custom');
-    setRenderConfig((prev) => ({
-      ...prev,
-      width: nextWidth,
-      height: nextHeight,
-    }));
-    syncCropRectForConfig(nextWidth, nextHeight);
-  };
-
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const viewportRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
   const sceneParamsRef = useRef(sceneParams);
+  const isPausedRef = useRef(isPaused);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const animationTickRef = useRef({ accumulator: 0 });
+  const animationActionRef = useRef<THREE.AnimationAction | null>(null);
+  const actionTimeRef = useRef(0);
+  const chartMetaRef = useRef({ lastStepCount: 0, lastSampleTime: 0, lastSampleIndex: -1 });
+  const metricsTargetsRef = useRef<{
+    motionBone: THREE.Object3D | null;
+    footBones: THREE.Bone[];
+    leftFootBones: THREE.Bone[];
+    rightFootBones: THREE.Bone[];
+    leftFootThreshold: number;
+    rightFootThreshold: number;
+    leftFootRange: number;
+    rightFootRange: number;
+    stepScale: number;
+  }>({
+    motionBone: null,
+    footBones: [],
+    leftFootBones: [],
+    rightFootBones: [],
+    leftFootThreshold: 1,
+    rightFootThreshold: 1,
+    leftFootRange: 0,
+    rightFootRange: 0,
+    stepScale: 1,
+  });
+  const metricsRef = useRef<{
+    hasPrev: boolean;
+    speed: number;
+    leftFootHeight: number | null;
+    rightFootHeight: number | null;
+    axisVelocity: THREE.Vector3;
+    rawStepCount: number;
+    stepCount: number;
+    leftFootContact: boolean | null;
+    rightFootContact: boolean | null;
+    leftFootLifted: boolean;
+    rightFootLifted: boolean;
+    lastLeftStepTime: number;
+    lastRightStepTime: number;
+    lastPos: THREE.Vector3;
+    tempPos: THREE.Vector3;
+    tempFootPos: THREE.Vector3;
+    lastUiUpdate: number;
+    frameIndex: number;
+    elapsed: number;
+    lastLoopIndex: number;
+    lastLoopTime: number;
+  }>({
+    hasPrev: false,
+    speed: 0,
+    leftFootHeight: null,
+    rightFootHeight: null,
+    axisVelocity: new THREE.Vector3(),
+    rawStepCount: 0,
+    stepCount: 0,
+    leftFootContact: null,
+    rightFootContact: null,
+    leftFootLifted: false,
+    rightFootLifted: false,
+    lastLeftStepTime: -Infinity,
+    lastRightStepTime: -Infinity,
+    lastPos: new THREE.Vector3(),
+    tempPos: new THREE.Vector3(),
+    tempFootPos: new THREE.Vector3(),
+    lastUiUpdate: 0,
+    frameIndex: 0,
+    elapsed: 0,
+    lastLoopIndex: 0,
+    lastLoopTime: 0,
+  });
   const sceneRef = useRef<{
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
@@ -388,108 +663,39 @@ const Converter: React.FC = () => {
     ambientLight: THREE.AmbientLight;
     floor: THREE.Mesh;
   } | null>(null);
-  const renderStateRef = useRef<{
-    isRendering: boolean;
-    recorder: MediaRecorder | null;
-    gif: GIF | null;
-    restore: (() => void) | null;
-  }>({
-    isRendering: false,
-    recorder: null,
-    gif: null,
-    restore: null,
-  });
+  const viewportSizeRef = useRef({ width: 1, height: 1 });
 
-  const recordCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const recordedChunks = useRef<Blob[]>([]);
-  const cropRectRef = useRef(cropRect);
-  const cropDragRef = useRef<{
-    pointerId: number;
-    startX: number;
-    startY: number;
-    origin: { x: number; y: number; width: number; height: number };
-    width: number;
-    height: number;
-  } | null>(null);
-
-  useEffect(() => {
-    renderConfigRef.current = renderConfig;
-  }, [renderConfig]);
-
-  useEffect(() => {
-    cropRectRef.current = cropRect;
-  }, [cropRect]);
-
-  const syncCropRectForConfig = useCallback(
-    (nextWidth: number, nextHeight: number, viewWidth?: number, viewHeight?: number) => {
-      const width = viewWidth ?? viewportSizeRef.current.width;
-      const height = viewHeight ?? viewportSizeRef.current.height;
-      setCropRect((prev) => getCropRectForAspect(prev, nextWidth / nextHeight, width, height));
-    },
-    [],
-  );
+  const togglePause = useCallback(() => {
+    setIsPaused((prev) => !prev);
+  }, []);
 
   const handleViewportResize = useCallback(() => {
     if (!canvasRef.current || !sceneRef.current) return;
-    if (renderStateRef.current.isRendering) return;
     const parent = canvasRef.current.parentElement;
     if (!parent) return;
     const width = parent.clientWidth;
     const height = parent.clientHeight;
+    const { camera, renderer } = sceneRef.current;
     const view = viewportSizeRef.current;
     if (view.width !== width || view.height !== height) {
       viewportSizeRef.current = { width, height };
-      const currentConfig = renderConfigRef.current;
-      syncCropRectForConfig(currentConfig.width, currentConfig.height, width, height);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height);
     }
+  }, []);
+
+  const handleViewportRef = useCallback((node: HTMLDivElement | null) => {
+    viewportRef.current = node;
+    if (!node) return;
+    const rect = node.getBoundingClientRect();
+    viewportSizeRef.current = { width: rect.width, height: rect.height };
+    if (!sceneRef.current) return;
     const { camera, renderer } = sceneRef.current;
-    camera.aspect = width / height;
+    camera.aspect = rect.width / rect.height;
     camera.updateProjectionMatrix();
-    renderer.setSize(width, height);
-  }, [syncCropRectForConfig]);
-
-  const handleViewportRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      viewportRef.current = node;
-      if (!node) return;
-      const rect = node.getBoundingClientRect();
-      viewportSizeRef.current = { width: rect.width, height: rect.height };
-      const currentConfig = renderConfigRef.current;
-      syncCropRectForConfig(currentConfig.width, currentConfig.height, rect.width, rect.height);
-    },
-    [syncCropRectForConfig],
-  );
-
-  const handleCropPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!viewportRef.current) return;
-    const bounds = viewportRef.current.getBoundingClientRect();
-    cropDragRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      origin: cropRectRef.current,
-      width: bounds.width,
-      height: bounds.height,
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const handleCropPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    const drag = cropDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    const dx = (event.clientX - drag.startX) / drag.width;
-    const dy = (event.clientY - drag.startY) / drag.height;
-    const nextX = clamp(drag.origin.x + dx, 0, 1 - drag.origin.width);
-    const nextY = clamp(drag.origin.y + dy, 0, 1 - drag.origin.height);
-    setCropRect({ ...drag.origin, x: nextX, y: nextY });
-  };
-
-  const handleCropPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
-    const drag = cropDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    cropDragRef.current = null;
-    event.currentTarget.releasePointerCapture(event.pointerId);
-  };
+    renderer.setSize(rect.width, rect.height);
+  }, []);
 
   // Sync scene state to Three.js objects
   useEffect(() => {
@@ -518,6 +724,47 @@ const Converter: React.FC = () => {
     renderer.toneMappingExposure = sceneParams.exposure;
     floor.visible = sceneParams.shadowsEnabled;
   }, [sceneParams]);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+    // Sync video play/pause state
+    const video = videoRef.current;
+    if (video) {
+      if (isPaused) {
+        video.pause();
+      } else {
+        video.play().catch(() => {});
+      }
+    }
+  }, [isPaused]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' || event.repeat) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      togglePause();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [togglePause]);
+
+  useEffect(() => {
+    if (!canvasRef.current || !sceneRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      handleViewportResize();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [handleViewportResize, isSidebarVisible]);
 
   // Initialize Scene (only runs once on mount, sceneParams changes handled by sync effect above)
   useEffect(() => {
@@ -596,11 +843,91 @@ const Converter: React.FC = () => {
       floor,
     };
 
+    const resetLoopState = (loopIndex: number, loopTime: number) => {
+      const metrics = metricsRef.current;
+      metrics.stepCount = 0;
+      metrics.rawStepCount = 0;
+      metrics.frameIndex = 0;
+      metrics.elapsed = 0;
+      metrics.hasPrev = false;
+      metrics.speed = 0;
+      metrics.axisVelocity.set(0, 0, 0);
+      metrics.leftFootHeight = null;
+      metrics.rightFootHeight = null;
+      metrics.leftFootContact = null;
+      metrics.rightFootContact = null;
+      metrics.leftFootLifted = false;
+      metrics.rightFootLifted = false;
+      metrics.lastLeftStepTime = -Infinity;
+      metrics.lastRightStepTime = -Infinity;
+      metrics.lastUiUpdate = 0;
+      metrics.lastLoopIndex = loopIndex;
+      metrics.lastLoopTime = loopTime;
+      chartMetaRef.current = { lastStepCount: 0, lastSampleTime: 0, lastSampleIndex: -1 };
+      dispatchChartSeries(() => ({ speed: [], stepRate: [] }));
+    };
+
     const animate = () => {
       requestAnimationFrame(animate);
-      if (renderStateRef.current.isRendering) return;
-      const delta = clock.getDelta() * sceneParamsRef.current.animationSpeed;
-      if (sceneRef.current?.mixer) sceneRef.current.mixer.update(delta);
+      const delta = clock.getDelta();
+      let advanced = 0;
+      let steps = 0;
+      let loopedThisFrame = false;
+      const mixer = sceneRef.current?.mixer;
+      if (mixer) {
+        if (!isPausedRef.current) {
+          const tick = animationTickRef.current;
+          tick.accumulator += delta;
+          while (tick.accumulator >= animationStep) {
+            mixer.update(animationStep);
+            tick.accumulator -= animationStep;
+            advanced += animationStep;
+            steps += 1;
+          }
+        } else {
+          animationTickRef.current.accumulator = 0;
+        }
+      }
+      if (steps > 0) {
+        metricsRef.current.frameIndex += steps;
+        metricsRef.current.elapsed += steps * animationStep;
+      }
+      const action = animationActionRef.current;
+      if (steps > 0 && action) {
+        const prevTime = actionTimeRef.current;
+        const currentTime = action.time;
+        const clipDuration = action.getClip().duration;
+        const loopIndex = clipDuration > 0 ? Math.floor(currentTime / clipDuration) : 0;
+        const loopTime =
+          clipDuration > 0 ? metricsRef.current.elapsed % clipDuration : metricsRef.current.elapsed;
+        // Sync video with animation
+        const video = videoRef.current;
+        if (video && video.duration && Number.isFinite(video.duration)) {
+          const animDuration = clipDuration;
+          if (animDuration > 0) {
+            const normalizedTime = loopTime / animDuration;
+            const targetVideoTime = normalizedTime * video.duration;
+            // Only seek if difference is significant (> 0.1s) to avoid constant seeking
+            if (Math.abs(video.currentTime - targetVideoTime) > 0.1) {
+              video.currentTime = targetVideoTime;
+            }
+          }
+        }
+        const loopedByTime =
+          clipDuration > 0 && loopTime + loopTimeEpsilon < metricsRef.current.lastLoopTime;
+        const didLoop =
+          currentTime + loopTimeEpsilon < prevTime ||
+          loopIndex !== metricsRef.current.lastLoopIndex ||
+          loopedByTime;
+        if (didLoop) {
+          resetLoopState(loopIndex, loopTime);
+          loopedThisFrame = true;
+        } else {
+          metricsRef.current.lastLoopIndex = loopIndex;
+          metricsRef.current.lastLoopTime = loopTime;
+        }
+        actionTimeRef.current = currentTime;
+      }
       if (sceneRef.current?.controls) sceneRef.current.controls.update();
       if (sceneRef.current?.skeletonHelper) {
         sceneRef.current.skeletonHelper.updateMatrixWorld(true);
@@ -608,12 +935,198 @@ const Converter: React.FC = () => {
       if (sceneRef.current?.rigHelper) {
         updateRigHelper(sceneRef.current.rigHelper);
       }
+
+      const model = sceneRef.current?.model;
+      if (model && !isPausedRef.current) {
+        const metrics = metricsRef.current;
+        const shouldSample = advanced > 0 || !metrics.hasPrev;
+        if (shouldSample) {
+          const motionTarget = metricsTargetsRef.current.motionBone ?? model;
+          motionTarget.getWorldPosition(metrics.tempPos);
+          if (metrics.hasPrev && advanced > 0) {
+            const deltaX = metrics.tempPos.x - metrics.lastPos.x;
+            const deltaY = metrics.tempPos.y - metrics.lastPos.y;
+            const deltaZ = metrics.tempPos.z - metrics.lastPos.z;
+            metrics.axisVelocity.set(deltaX / advanced, deltaY / advanced, deltaZ / advanced);
+            metrics.speed = metrics.axisVelocity.length();
+          } else if (!metrics.hasPrev) {
+            metrics.speed = 0;
+            metrics.axisVelocity.set(0, 0, 0);
+          }
+          metrics.lastPos.copy(metrics.tempPos);
+          metrics.hasPrev = true;
+
+          const targets = metricsTargetsRef.current;
+          const { footBones, leftFootBones, rightFootBones } = targets;
+          let leftFootHeight: number | null = null;
+          let rightFootHeight: number | null = null;
+          let groundY: number | null = null;
+
+          if (footBones.length > 0) {
+            let leftMin = Infinity;
+            let rightMin = Infinity;
+            let minY = Infinity;
+            const useAxisSplit = leftFootBones.length === 0 || rightFootBones.length === 0;
+
+            if (useAxisSplit) {
+              for (const bone of footBones) {
+                bone.getWorldPosition(metrics.tempFootPos);
+                minY = Math.min(minY, metrics.tempFootPos.y);
+                if (metrics.tempFootPos.x <= 0) {
+                  leftMin = Math.min(leftMin, metrics.tempFootPos.y);
+                } else {
+                  rightMin = Math.min(rightMin, metrics.tempFootPos.y);
+                }
+              }
+            } else {
+              for (const bone of leftFootBones) {
+                bone.getWorldPosition(metrics.tempFootPos);
+                minY = Math.min(minY, metrics.tempFootPos.y);
+                leftMin = Math.min(leftMin, metrics.tempFootPos.y);
+              }
+              for (const bone of rightFootBones) {
+                bone.getWorldPosition(metrics.tempFootPos);
+                minY = Math.min(minY, metrics.tempFootPos.y);
+                rightMin = Math.min(rightMin, metrics.tempFootPos.y);
+              }
+            }
+
+            if (Number.isFinite(minY)) groundY = minY;
+            if (Number.isFinite(leftMin)) leftFootHeight = leftMin;
+            if (Number.isFinite(rightMin)) rightFootHeight = rightMin;
+          }
+
+          metrics.leftFootHeight = leftFootHeight;
+          metrics.rightFootHeight = rightFootHeight;
+
+          const leftRelativeHeight =
+            leftFootHeight !== null && groundY !== null ? leftFootHeight - groundY : null;
+          const rightRelativeHeight =
+            rightFootHeight !== null && groundY !== null ? rightFootHeight - groundY : null;
+
+          const action = animationActionRef.current;
+          const clipDuration = action?.getClip().duration ?? 0;
+          const timeInLoop = clipDuration > 0 ? metrics.elapsed % clipDuration : metrics.elapsed;
+          if (!loopedThisFrame && clipDuration > 0) {
+            if (timeInLoop + loopTimeEpsilon < metrics.lastLoopTime) {
+              resetLoopState(metrics.lastLoopIndex, timeInLoop);
+            } else {
+              metrics.lastLoopTime = timeInLoop;
+            }
+          }
+          let stepDelta = 0;
+          const leftLiftThreshold = calcLiftThreshold(
+            targets.leftFootThreshold,
+            targets.leftFootRange,
+          );
+          const rightLiftThreshold = calcLiftThreshold(
+            targets.rightFootThreshold,
+            targets.rightFootRange,
+          );
+          const leftReady =
+            targets.leftFootRange >= minFootLiftRange &&
+            leftRelativeHeight !== null &&
+            leftRelativeHeight >= leftLiftThreshold;
+          const rightReady =
+            targets.rightFootRange >= minFootLiftRange &&
+            rightRelativeHeight !== null &&
+            rightRelativeHeight >= rightLiftThreshold;
+
+          if (
+            !metrics.leftFootLifted &&
+            leftReady &&
+            timeInLoop - metrics.lastLeftStepTime >= minStepInterval
+          ) {
+            stepDelta += 0.5;
+            metrics.lastLeftStepTime = timeInLoop;
+          }
+          if (
+            !metrics.rightFootLifted &&
+            rightReady &&
+            timeInLoop - metrics.lastRightStepTime >= minStepInterval
+          ) {
+            stepDelta += 0.5;
+            metrics.lastRightStepTime = timeInLoop;
+          }
+
+          metrics.leftFootLifted = leftReady;
+          metrics.rightFootLifted = rightReady;
+          metrics.leftFootContact =
+            leftRelativeHeight === null
+              ? null
+              : leftRelativeHeight <= targets.leftFootThreshold + footContactSlack;
+          metrics.rightFootContact =
+            rightRelativeHeight === null
+              ? null
+              : rightRelativeHeight <= targets.rightFootThreshold + footContactSlack;
+
+          if (stepDelta > 0) {
+            metrics.rawStepCount += stepDelta;
+            const stepScale = Number.isFinite(targets.stepScale) ? targets.stepScale : 1;
+            metrics.stepCount = Math.round(metrics.rawStepCount * stepScale * 2) / 2;
+          }
+
+          const normalized =
+            clipDuration > 0 ? Math.min(Math.max(timeInLoop / clipDuration, 0), 1) : 0;
+          const sampleIndex = Math.min(chartWindow - 1, Math.floor(normalized * chartWindow));
+          const chartMeta = chartMetaRef.current;
+
+          if (sampleIndex !== chartMeta.lastSampleIndex) {
+            const deltaSeconds = timeInLoop - chartMeta.lastSampleTime;
+            if (deltaSeconds > 0) {
+              const stepDelta = metrics.stepCount - chartMeta.lastStepCount;
+              const stepRate = stepDelta / deltaSeconds;
+              const speedValue = Number.isFinite(metrics.speed) ? metrics.speed * cmToMeter : 0;
+              dispatchChartSeries((prevSeries) => {
+                const nextSpeed = [...prevSeries.speed, speedValue];
+                const nextStepRate = [...prevSeries.stepRate, stepRate];
+                if (nextSpeed.length > chartWindow) {
+                  nextSpeed.splice(0, nextSpeed.length - chartWindow);
+                }
+                if (nextStepRate.length > chartWindow) {
+                  nextStepRate.splice(0, nextStepRate.length - chartWindow);
+                }
+                return { speed: nextSpeed, stepRate: nextStepRate };
+              });
+              chartMetaRef.current = {
+                lastStepCount: metrics.stepCount,
+                lastSampleTime: timeInLoop,
+                lastSampleIndex: sampleIndex,
+              };
+            } else {
+              chartMetaRef.current = {
+                lastStepCount: metrics.stepCount,
+                lastSampleTime: timeInLoop,
+                lastSampleIndex: sampleIndex,
+              };
+            }
+          }
+
+          const now = performance.now();
+          if (now - metrics.lastUiUpdate > 150) {
+            dispatchMotionStats({
+              speed: metrics.speed,
+              stepCount: metrics.stepCount,
+              leftFootHeight,
+              rightFootHeight,
+              axisDelta: {
+                x: metrics.axisVelocity.x,
+                y: metrics.axisVelocity.y,
+                z: metrics.axisVelocity.z,
+              },
+              frameIndex: metrics.frameIndex,
+              elapsed: metrics.elapsed,
+            });
+            metrics.lastUiUpdate = now;
+          }
+        }
+      }
       renderer.render(scene, camera);
     };
     animate();
 
     const parent = canvasRef.current?.parentElement;
-    if (parent && !renderStateRef.current.isRendering) {
+    if (parent) {
       const width = parent.clientWidth;
       const height = parent.clientHeight;
       viewportSizeRef.current = { width, height };
@@ -636,7 +1149,45 @@ const Converter: React.FC = () => {
 
     setLoading(true);
     setFile(uploadedFile);
-    setVideoUrl(null);
+    setSelectedExampleId(null);
+    setCurrentVideoUrl(null);
+    dispatchMotionStats(initialMotionStats);
+    setIsPaused(false);
+    dispatchChartSeries(() => ({ speed: [], stepRate: [] }));
+    chartMetaRef.current = { lastStepCount: 0, lastSampleTime: 0, lastSampleIndex: -1 };
+    metricsRef.current = {
+      ...metricsRef.current,
+      hasPrev: false,
+      speed: 0,
+      leftFootHeight: null,
+      rightFootHeight: null,
+      axisVelocity: new THREE.Vector3(),
+      rawStepCount: 0,
+      stepCount: 0,
+      leftFootContact: null,
+      rightFootContact: null,
+      leftFootLifted: false,
+      rightFootLifted: false,
+      lastLeftStepTime: -Infinity,
+      lastRightStepTime: -Infinity,
+      lastUiUpdate: 0,
+      frameIndex: 0,
+      elapsed: 0,
+      lastLoopIndex: 0,
+      lastLoopTime: 0,
+    };
+    metricsTargetsRef.current = {
+      motionBone: null,
+      footBones: [],
+      leftFootBones: [],
+      rightFootBones: [],
+      leftFootThreshold: 1,
+      rightFootThreshold: 1,
+      leftFootRange: 0,
+      rightFootRange: 0,
+      stepScale: 1,
+    };
+    animationTickRef.current.accumulator = 0;
 
     const extension = uploadedFile.name.split('.').pop()?.toLowerCase();
     const reader = new FileReader();
@@ -651,23 +1202,6 @@ const Converter: React.FC = () => {
           const loader = new FBXLoader();
           object = loader.parse(contents, '');
           animations = object.animations;
-        } else if (extension === 'glb' || extension === 'gltf') {
-          const loader = new GLTFLoader();
-          const gltf = await new Promise<any>((resolve, reject) => {
-            loader.parse(contents, '', resolve, reject);
-          });
-          let sceneRoot = gltf.scene ?? gltf.scenes?.[0] ?? null;
-          if (!sceneRoot || sceneRoot.children.length === 0) {
-            const nodes = await gltf.parser.getDependencies('node');
-            const rootNodes = nodes.filter((node: THREE.Object3D) => !node.parent);
-            if (rootNodes.length > 0) {
-              const group = new THREE.Group();
-              rootNodes.forEach((node: THREE.Object3D) => group.add(node));
-              sceneRoot = group;
-            }
-          }
-          object = sceneRoot;
-          animations = gltf.animations;
         }
 
         if (!object) throw new Error('Unsupported format');
@@ -712,9 +1246,11 @@ const Converter: React.FC = () => {
         root.userData.animations = animations;
 
         let mixer: THREE.AnimationMixer | null = null;
+        let action: THREE.AnimationAction | null = null;
         if (animations.length > 0) {
           mixer = new THREE.AnimationMixer(root);
-          mixer.clipAction(animations[0]).play();
+          action = mixer.clipAction(animations[0]);
+          action.play();
           mixer.setTime(0);
         }
 
@@ -737,6 +1273,43 @@ const Converter: React.FC = () => {
         }
         sceneRef.current!.model = root;
         sceneRef.current!.mixer = mixer;
+        animationActionRef.current = action;
+        actionTimeRef.current = 0;
+        const bones = collectBones(root);
+        const footBones = pickFootBones(bones);
+        const { left: leftFootBones, right: rightFootBones } = resolveFootSides(root, footBones);
+
+        // Calculate dynamic foot thresholds by pre-analyzing animation
+        let leftFootThreshold = 1;
+        let rightFootThreshold = 1;
+        let leftFootRange = 0;
+        let rightFootRange = 0;
+        if (mixer && action && footBones.length > 0) {
+          const thresholds = analyzeFootThresholds(
+            root,
+            mixer,
+            action,
+            footBones,
+            leftFootBones,
+            rightFootBones,
+          );
+          leftFootThreshold = thresholds.leftThreshold;
+          rightFootThreshold = thresholds.rightThreshold;
+          leftFootRange = thresholds.leftRange;
+          rightFootRange = thresholds.rightRange;
+        }
+
+        metricsTargetsRef.current = {
+          motionBone: pickMotionBone(bones),
+          footBones,
+          leftFootBones,
+          rightFootBones,
+          leftFootThreshold,
+          rightFootThreshold,
+          leftFootRange,
+          rightFootRange,
+          stepScale: 1,
+        };
         if (!hasMesh) {
           frameCameraToObject(sceneRef.current!.camera, sceneRef.current!.controls, root);
         } else {
@@ -752,8 +1325,6 @@ const Converter: React.FC = () => {
           if ((child as THREE.Bone).isBone) meta.boneCount++;
         });
 
-        const primaryClip = animations[0] ?? null;
-        setFrameProgress({ current: 0, total: getClipFrameCount(primaryClip) });
         setMetadata(meta);
         setActiveTab('info');
       } catch (err) {
@@ -765,310 +1336,251 @@ const Converter: React.FC = () => {
     reader.readAsArrayBuffer(uploadedFile);
   };
 
-  const startRendering = async () => {
-    if (!canvasRef.current || !sceneRef.current?.mixer) return;
-    if (renderStateRef.current.isRendering) return;
+  const loadExample = async (example: ExampleItem) => {
+    if (!sceneRef.current) return;
 
-    renderStateRef.current.isRendering = true;
-    setIsRendering(true);
-    setRenderNotice(null);
-    recordedChunks.current = [];
-    setProgress(0);
-    renderStateRef.current.recorder = null;
-    renderStateRef.current.gif = null;
-
-    const { renderer, scene, camera, mixer, controls, model } = sceneRef.current;
-
-    const originalSize = new THREE.Vector2();
-    renderer.getSize(originalSize);
-    const originalPixelRatio = renderer.getPixelRatio();
-    const originalCamera = {
-      position: camera.position.clone(),
-      quaternion: camera.quaternion.clone(),
-      near: camera.near,
-      far: camera.far,
-      aspect: camera.aspect,
+    setLoading(true);
+    setSelectedExampleId(example.id);
+    setCurrentVideoUrl(example.videoUrl);
+    dispatchMotionStats(initialMotionStats);
+    setIsPaused(false);
+    dispatchChartSeries(() => ({ speed: [], stepRate: [] }));
+    chartMetaRef.current = { lastStepCount: 0, lastSampleTime: 0, lastSampleIndex: -1 };
+    metricsRef.current = {
+      ...metricsRef.current,
+      hasPrev: false,
+      speed: 0,
+      leftFootHeight: null,
+      rightFootHeight: null,
+      axisVelocity: new THREE.Vector3(),
+      rawStepCount: 0,
+      stepCount: 0,
+      leftFootContact: null,
+      rightFootContact: null,
+      leftFootLifted: false,
+      rightFootLifted: false,
+      lastLeftStepTime: -Infinity,
+      lastRightStepTime: -Infinity,
+      lastUiUpdate: 0,
+      frameIndex: 0,
+      elapsed: 0,
+      lastLoopIndex: 0,
+      lastLoopTime: 0,
     };
-    const originalControls = {
-      target: controls.target.clone(),
-      enabled: controls.enabled,
+    metricsTargetsRef.current = {
+      motionBone: null,
+      footBones: [],
+      leftFootBones: [],
+      rightFootBones: [],
+      leftFootThreshold: 1,
+      rightFootThreshold: 1,
+      leftFootRange: 0,
+      rightFootRange: 0,
+      stepScale: 1,
     };
+    animationTickRef.current.accumulator = 0;
 
-    const restoreAfterRecording = () => {
-      renderer.setPixelRatio(originalPixelRatio);
-      renderer.setSize(originalSize.x, originalSize.y, false);
-      camera.position.copy(originalCamera.position);
-      camera.quaternion.copy(originalCamera.quaternion);
-      camera.near = originalCamera.near;
-      camera.far = originalCamera.far;
-      camera.aspect = originalCamera.aspect;
-      camera.updateProjectionMatrix();
-      controls.target.copy(originalControls.target);
-      controls.enabled = originalControls.enabled;
-      controls.update();
-    };
-    renderStateRef.current.restore = restoreAfterRecording;
-
-    controls.enabled = false;
-    if (renderConfig.viewMode === 'fit' && model) {
-      frameCameraToObject(camera, controls, model);
-    }
-
-    const recordCanvas = document.createElement('canvas');
-    recordCanvas.width = renderConfig.width;
-    recordCanvas.height = renderConfig.height;
-    recordCanvasRef.current = recordCanvas;
-    const recordContext = recordCanvas.getContext('2d');
-    if (!recordContext) {
-      setIsRendering(false);
-      renderStateRef.current.isRendering = false;
-      renderStateRef.current.recorder = null;
-      restoreAfterRecording();
-      renderStateRef.current.restore = null;
-      return;
-    }
-
-    const drawCroppedFrame = () => {
-      const source = renderer.domElement;
-      const crop = getCropRectForAspect(
-        cropRectRef.current,
-        renderConfig.width / renderConfig.height,
-        source.width,
-        source.height,
-      );
-      const sw = Math.max(1, crop.width * source.width);
-      const sh = Math.max(1, crop.height * source.height);
-      const sx = clamp(crop.x * source.width, 0, source.width - sw);
-      const sy = clamp(crop.y * source.height, 0, source.height - sh);
-      recordContext.clearRect(0, 0, recordCanvas.width, recordCanvas.height);
-      recordContext.drawImage(
-        source,
-        sx,
-        sy,
-        sw,
-        sh,
-        0,
-        0,
-        recordCanvas.width,
-        recordCanvas.height,
-      );
-    };
-
-    const root = mixer.getRoot() as THREE.Object3D & { animations: THREE.AnimationClip[] };
-    const animationList = (root.userData?.animations ||
-      (root as any).animations ||
-      []) as THREE.AnimationClip[];
-    const animation = animationList.length > 0 ? animationList[0] : null;
-
-    const clipFrameTotal = getClipFrameCount(animation);
-    setFrameProgress({ current: 0, total: clipFrameTotal });
-
-    const clipDuration = animation ? mixer.existingAction(animation)?.getClip().duration || 0 : 0;
-    const targetDuration = renderConfig.duration > 0 ? renderConfig.duration : clipDuration || 5;
-    const totalFrames = Math.max(1, Math.ceil(targetDuration * renderConfig.fps));
-    const frameTime = 1 / renderConfig.fps;
-    const frameDelayMs = 1000 / renderConfig.fps;
-
-    const updateFrameProgress = (time: number) => {
-      if (clipFrameTotal <= 0 || clipDuration <= 0) return;
-      const normalized = clamp(time / clipDuration, 0, 1);
-      const nextFrame = Math.min(
-        clipFrameTotal,
-        Math.max(1, Math.floor(normalized * clipFrameTotal) + 1),
-      );
-      setFrameProgress({ current: nextFrame, total: clipFrameTotal });
-    };
-
-    mixer.stopAllAction();
-    const action = animation ? mixer.clipAction(animation) : null;
-    if (action) action.reset().play();
-
-    if (renderConfig.format === 'gif') {
-      const gif = new GIF({
-        workers: Math.min(4, navigator.hardwareConcurrency || 4),
-        quality: renderConfig.gifQuality,
-        workerScript: gifWorkerUrl,
-        width: renderConfig.width,
-        height: renderConfig.height,
-      });
-      renderStateRef.current.gif = gif;
-
-      gif.on('finished', (blob: Blob) => {
-        setVideoUrl(URL.createObjectURL(blob));
-        setVideoFormat('gif');
-        setIsRendering(false);
-        setProgress(100);
-        setFrameProgress((prev) => ({ ...prev, current: prev.total }));
-        renderStateRef.current.isRendering = false;
-        renderStateRef.current.gif = null;
-        restoreAfterRecording();
-        renderStateRef.current.restore = null;
-      });
-
-      for (let i = 0; i < totalFrames && renderStateRef.current.isRendering; i++) {
-        const elapsed = i * frameTime * sceneParams.animationSpeed;
-        const time = clipDuration > 0 ? elapsed % clipDuration : 0;
-        mixer.setTime(time);
-        if (sceneRef.current?.skeletonHelper) {
-          sceneRef.current.skeletonHelper.updateMatrixWorld(true);
-        }
-        if (sceneRef.current?.rigHelper) {
-          updateRigHelper(sceneRef.current.rigHelper);
-        }
-        renderer.render(scene, camera);
-        drawCroppedFrame();
-        updateFrameProgress(time);
-        gif.addFrame(recordCanvas, { copy: true, delay: frameDelayMs });
-        await new Promise((r) => setTimeout(r, frameDelayMs));
-        setProgress(Math.round(((i + 1) / totalFrames) * 100));
-      }
-
-      if (!renderStateRef.current.isRendering) {
-        gif.abort();
-        renderStateRef.current.gif = null;
-        restoreAfterRecording();
-        renderStateRef.current.restore = null;
-        return;
-      }
-
-      gif.render();
-      return;
-    }
-
-    drawCroppedFrame();
-    const stream = recordCanvas.captureStream(renderConfig.fps);
-    const { mimeType, format: formatUsedRaw, notice } = getRecordingOptions(renderConfig.format);
-    let formatUsed = formatUsedRaw;
-    if (notice) setRenderNotice(t.formatFallback);
-
-    let recorder: MediaRecorder;
     try {
-      recorder = new MediaRecorder(
-        stream,
-        mimeType
-          ? { mimeType, videoBitsPerSecond: renderConfig.bitrate }
-          : { videoBitsPerSecond: renderConfig.bitrate },
-      );
-      if (recorder.mimeType) {
-        formatUsed = recorder.mimeType.includes('mp4') ? 'mp4' : 'webm';
-      }
-    } catch (_err) {
-      const fallback = getRecordingOptions('webm');
-      formatUsed = fallback.format;
-      setRenderNotice(t.formatFallback);
-      recorder = new MediaRecorder(
-        stream,
-        fallback.mimeType
-          ? { mimeType: fallback.mimeType, videoBitsPerSecond: renderConfig.bitrate }
-          : { videoBitsPerSecond: renderConfig.bitrate },
-      );
-      if (recorder.mimeType) {
-        formatUsed = recorder.mimeType.includes('mp4') ? 'mp4' : 'webm';
-      }
-    }
-    renderStateRef.current.recorder = recorder;
+      const response = await fetch(example.fbxUrl);
+      const arrayBuffer = await response.arrayBuffer();
 
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) recordedChunks.current.push(e.data);
-    };
-    recorder.onstop = () => {
-      const blobType = formatUsed === 'mp4' ? 'video/mp4' : 'video/webm';
-      const blob = new Blob(recordedChunks.current, { type: blobType });
-      setVideoUrl(URL.createObjectURL(blob));
-      setVideoFormat(formatUsed);
-      setIsRendering(false);
-      setProgress(100);
-      setFrameProgress((prev) => ({ ...prev, current: prev.total }));
-      renderStateRef.current.isRendering = false;
-      renderStateRef.current.recorder = null;
-      restoreAfterRecording();
-      renderStateRef.current.restore = null;
-    };
-    recorder.onerror = () => {
-      setIsRendering(false);
-      renderStateRef.current.isRendering = false;
-      renderStateRef.current.recorder = null;
-      restoreAfterRecording();
-      renderStateRef.current.restore = null;
-    };
+      const loader = new FBXLoader();
+      const object = loader.parse(arrayBuffer, '');
+      const animations = object.animations;
 
-    recorder.start();
-
-    for (let i = 0; i < totalFrames && renderStateRef.current.isRendering; i++) {
-      const elapsed = i * frameTime * sceneParams.animationSpeed;
-      const time = clipDuration > 0 ? elapsed % clipDuration : 0;
-      mixer.setTime(time);
+      if (sceneRef.current?.model) sceneRef.current.scene.remove(sceneRef.current.model);
       if (sceneRef.current?.skeletonHelper) {
-        sceneRef.current.skeletonHelper.updateMatrixWorld(true);
+        sceneRef.current.scene.remove(sceneRef.current.skeletonHelper);
+        sceneRef.current.skeletonHelper.geometry.dispose();
+        if (Array.isArray(sceneRef.current.skeletonHelper.material)) {
+          sceneRef.current.skeletonHelper.material.forEach((material) => material.dispose());
+        } else {
+          sceneRef.current.skeletonHelper.material.dispose();
+        }
+        sceneRef.current.skeletonHelper = null;
       }
       if (sceneRef.current?.rigHelper) {
-        updateRigHelper(sceneRef.current.rigHelper);
+        sceneRef.current.scene.remove(sceneRef.current.rigHelper.helper);
+        sceneRef.current.rigHelper.helper.geometry.dispose();
+        if (Array.isArray(sceneRef.current.rigHelper.helper.material)) {
+          sceneRef.current.rigHelper.helper.material.forEach((material) => material.dispose());
+        } else {
+          sceneRef.current.rigHelper.helper.material.dispose();
+        }
+        sceneRef.current.rigHelper = null;
       }
-      renderer.render(scene, camera);
-      drawCroppedFrame();
-      updateFrameProgress(time);
-      await new Promise((r) => setTimeout(r, frameDelayMs));
-      setProgress(Math.round(((i + 1) / totalFrames) * 100));
-    }
 
-    if (recorder.state !== 'inactive') {
-      recorder.stop();
+      const root = new THREE.Group();
+      root.add(object);
+      const preciseBounds = needsPreciseBounds(object);
+
+      let hasMesh = false;
+      let hasBone = false;
+      object.traverse((child) => {
+        if ((child as THREE.Bone).isBone) hasBone = true;
+        if ((child as THREE.Mesh).isMesh) {
+          hasMesh = true;
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+
+      root.userData.animations = animations;
+
+      let mixer: THREE.AnimationMixer | null = null;
+      let action: THREE.AnimationAction | null = null;
+      if (animations.length > 0) {
+        mixer = new THREE.AnimationMixer(root);
+        action = mixer.clipAction(animations[0]);
+        action.play();
+        mixer.setTime(0);
+      }
+
+      alignRootToGround(root, 250, preciseBounds);
+
+      sceneRef.current!.scene.add(root);
+      if (!hasMesh && hasBone) {
+        const helper = new THREE.SkeletonHelper(root);
+        helper.material = new THREE.LineBasicMaterial({ color: 0xff7a18 });
+        helper.frustumCulled = false;
+        sceneRef.current!.scene.add(helper);
+        sceneRef.current!.skeletonHelper = helper;
+      } else if (!hasMesh) {
+        const rigHelper = createRigHelper(root);
+        if (rigHelper) {
+          sceneRef.current!.scene.add(rigHelper.helper);
+          sceneRef.current!.rigHelper = rigHelper;
+          updateRigHelper(rigHelper);
+        }
+      }
+      sceneRef.current!.model = root;
+      sceneRef.current!.mixer = mixer;
+      animationActionRef.current = action;
+      actionTimeRef.current = 0;
+      const bones = collectBones(root);
+      const footBones = pickFootBones(bones);
+      const { left: leftFootBones, right: rightFootBones } = resolveFootSides(root, footBones);
+
+      // Calculate dynamic foot thresholds by pre-analyzing animation
+      let leftFootThreshold = 1;
+      let rightFootThreshold = 1;
+      let leftFootRange = 0;
+      let rightFootRange = 0;
+      let stepScale = 1;
+      if (mixer && action && footBones.length > 0) {
+        const thresholds = analyzeFootThresholds(
+          root,
+          mixer,
+          action,
+          footBones,
+          leftFootBones,
+          rightFootBones,
+        );
+        leftFootThreshold = thresholds.leftThreshold;
+        rightFootThreshold = thresholds.rightThreshold;
+        leftFootRange = thresholds.leftRange;
+        rightFootRange = thresholds.rightRange;
+
+        const expectedSteps = EXAMPLE_STEP_TARGETS[example.label];
+        if (expectedSteps !== undefined) {
+          const rawSteps = estimateStepCount(
+            root,
+            mixer,
+            action,
+            footBones,
+            leftFootBones,
+            rightFootBones,
+            thresholds,
+          );
+          if (rawSteps > 0) {
+            stepScale = expectedSteps / rawSteps;
+          } else if (expectedSteps === 0) {
+            stepScale = 0;
+          }
+        }
+      }
+
+      metricsTargetsRef.current = {
+        motionBone: pickMotionBone(bones),
+        footBones,
+        leftFootBones,
+        rightFootBones,
+        leftFootThreshold,
+        rightFootThreshold,
+        leftFootRange,
+        rightFootRange,
+        stepScale,
+      };
+      if (!hasMesh) {
+        frameCameraToObject(sceneRef.current!.camera, sceneRef.current!.controls, root);
+      } else {
+        applyViewForModel(sceneRef.current!.camera, sceneRef.current!.controls, root);
+      }
+
+      const meta: ModelMetadata = {
+        name: `${t.example}${example.label}.fbx`,
+        boneCount: 0,
+        animations: animations.map((a) => ({ name: a.name, duration: a.duration })),
+      };
+      object.traverse((child) => {
+        if ((child as THREE.Bone).isBone) meta.boneCount++;
+      });
+
+      setMetadata(meta);
+      setFile(new File([], `${t.example}${example.label}.fbx`));
+      setActiveTab('info');
+    } catch (err) {
+      console.error('Error loading example:', err);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const logViewParams = () => {
-    if (!sceneRef.current) return;
-    const { camera, controls, renderer } = sceneRef.current;
-    console.warn('View params', {
-      camera: {
-        position: camera.position.toArray(),
-        quaternion: camera.quaternion.toArray(),
-        fov: camera.fov,
-        near: camera.near,
-        far: camera.far,
-        aspect: camera.aspect,
-      },
-      controls: {
-        target: controls.target.toArray(),
-      },
-      viewport: {
-        width: renderer.domElement.width,
-        height: renderer.domElement.height,
-        pixelRatio: renderer.getPixelRatio(),
-      },
-    });
-  };
-
-  const cancelRendering = () => {
-    renderStateRef.current.isRendering = false;
-    if (renderStateRef.current.recorder && renderStateRef.current.recorder.state !== 'inactive') {
-      renderStateRef.current.recorder.stop();
-    }
-    if (renderStateRef.current.gif) {
-      renderStateRef.current.gif.abort();
-      renderStateRef.current.gif = null;
-    }
-    if (renderStateRef.current.restore) {
-      renderStateRef.current.restore();
-      renderStateRef.current.restore = null;
-    }
-    setIsRendering(false);
-    setFrameProgress((prev) => ({ ...prev, current: 0 }));
-  };
-
-  const canAdjustCrop = activeTab === 'export' && !isRendering;
-  const framePercent =
-    frameProgress.total > 0
-      ? Math.min(100, Math.round((frameProgress.current / frameProgress.total) * 100))
-      : 0;
-
+  const speedText = Number.isFinite(motionStats.speed)
+    ? `${(motionStats.speed * cmToMeter).toFixed(2)} ${t.unitSpeed}`
+    : t.noData;
+  const leftFootHeightText =
+    motionStats.leftFootHeight === null
+      ? t.noData
+      : `${(motionStats.leftFootHeight * cmToMeter).toFixed(2)} ${t.unitDistance}`;
+  const rightFootHeightText =
+    motionStats.rightFootHeight === null
+      ? t.noData
+      : `${(motionStats.rightFootHeight * cmToMeter).toFixed(2)} ${t.unitDistance}`;
+  const axisDeltaValues = [
+    motionStats.axisDelta.x,
+    motionStats.axisDelta.y,
+    motionStats.axisDelta.z,
+  ];
+  const axisDeltaText = axisDeltaValues.every((value) => Number.isFinite(value))
+    ? `X:${(motionStats.axisDelta.x * cmToMeter).toFixed(2)} Y:${(
+        motionStats.axisDelta.y * cmToMeter
+      ).toFixed(2)} Z:${(motionStats.axisDelta.z * cmToMeter).toFixed(2)} ${t.unitSpeed}`
+    : t.noData;
+  const stepCountText = Number.isFinite(motionStats.stepCount)
+    ? `${motionStats.stepCount}`
+    : t.noData;
+  const frameText = Number.isFinite(motionStats.frameIndex)
+    ? `#${motionStats.frameIndex}`
+    : t.noData;
+  const elapsedText = Number.isFinite(motionStats.elapsed)
+    ? `${motionStats.elapsed.toFixed(2)} ${t.unitTime}`
+    : t.noData;
+  const stepRateValue =
+    chartSeries.stepRate.length > 0 ? chartSeries.stepRate[chartSeries.stepRate.length - 1] : NaN;
+  const stepRateText = Number.isFinite(stepRateValue)
+    ? `${stepRateValue.toFixed(2)} ${t.unitRate}`
+    : t.noData;
+  const speedSpark = buildSparklinePath(chartSeries.speed, chartWidth, chartHeight);
+  const stepSpark = buildSparklinePath(chartSeries.stepRate, chartWidth, chartHeight);
+  const pauseText = isPaused ? t.resume : t.pause;
   return (
     <div className="flex flex-col h-full bg-slate-950 text-slate-100 selection:bg-indigo-500/30 font-sans">
       {/* Header */}
       <header className="flex items-center justify-between px-6 py-4 bg-slate-900 border-b border-white/5 shadow-2xl z-10">
         <div className="flex items-center gap-4">
           <div className="bg-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-600/20">
-            <Video className="w-6 h-6 text-white" />
+            <Box className="w-6 h-6 text-white" />
           </div>
           <div>
             <h1 className="font-bold text-xl tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
@@ -1082,6 +1594,19 @@ const Converter: React.FC = () => {
 
         <div className="flex items-center gap-4">
           <button
+            onClick={() => setIsSidebarVisible((prev) => !prev)}
+            className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white px-3 py-2 rounded-xl transition border border-white/10"
+          >
+            {isSidebarVisible ? (
+              <PanelLeftClose className="w-4 h-4" />
+            ) : (
+              <PanelLeftOpen className="w-4 h-4" />
+            )}
+            <span className="text-xs font-bold uppercase tracking-widest">
+              {isSidebarVisible ? t.hidePanel : t.showPanel}
+            </span>
+          </button>
+          <button
             onClick={() => setLang(lang === 'en' ? 'zh' : 'en')}
             className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white px-3 py-2 rounded-xl transition border border-white/10"
           >
@@ -1094,617 +1619,413 @@ const Converter: React.FC = () => {
           <label className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-white px-5 py-2.5 rounded-xl cursor-pointer transition border border-white/10">
             <Upload className="w-4 h-4 text-indigo-400" />
             <span className="text-sm font-semibold">{t.loadModel}</span>
-            <input
-              type="file"
-              accept=".fbx,.glb,.gltf"
-              className="hidden"
-              onChange={handleFileUpload}
-            />
+            <input type="file" accept=".fbx" className="hidden" onChange={handleFileUpload} />
           </label>
         </div>
       </header>
 
       <main className="flex-1 flex overflow-hidden">
         {/* Left Sidebar */}
-        <aside className="w-96 bg-slate-900 border-r border-white/5 flex flex-col shadow-2xl relative z-10">
-          <div className="flex border-b border-white/5">
-            {[
-              { id: 'info', icon: Box, label: 'tabModel' },
-              { id: 'settings', icon: Palette, label: 'tabRender' },
-              { id: 'export', icon: Activity, label: 'tabExport' },
-            ].map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
-                className={`flex-1 py-4 flex flex-col items-center gap-1 transition ${activeTab === tab.id ? 'text-indigo-400 border-b-2 border-indigo-400 bg-white/5' : 'text-slate-500 hover:text-slate-300'}`}
-              >
-                <tab.icon className="w-4 h-4" />
-                <span className="text-[9px] font-bold uppercase tracking-tighter">
-                  {(t as any)[tab.label]}
-                </span>
-              </button>
-            ))}
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-5 space-y-6">
-            {loading ? (
-              <div className="h-full flex flex-col items-center justify-center gap-4 text-slate-500">
-                <Loader2 className="w-10 h-10 animate-spin text-indigo-500" />
-                <p className="text-xs font-bold animate-pulse">{t.compiling}</p>
+        {isSidebarVisible && (
+          <aside className="w-96 bg-slate-900 border-r border-white/5 flex flex-col shadow-2xl relative z-10">
+            {/* Examples Section */}
+            <div className="p-4 border-b border-white/5">
+              <div className="flex items-center gap-2 mb-3 text-indigo-400">
+                <FolderOpen className="w-4 h-4" />
+                <span className="text-xs font-bold uppercase tracking-widest">{t.examples}</span>
               </div>
-            ) : metadata ? (
-              <>
-                {activeTab === 'info' && (
-                  <div className="space-y-6 animate-in slide-in-from-left-4">
-                    <div className="bg-slate-800/50 p-4 rounded-2xl border border-white/5 shadow-inner">
-                      <div className="flex items-center gap-3 mb-3 text-indigo-400">
-                        {metadata.name.toLowerCase().endsWith('.fbx') ? (
-                          <FileCode className="w-4 h-4" />
-                        ) : (
-                          <Box className="w-4 h-4" />
-                        )}
-                        <span className="text-xs font-bold uppercase tracking-widest">
-                          {t.geometry}
-                        </span>
-                      </div>
-                      <p className="text-sm font-medium truncate mb-1">{metadata.name}</p>
-                      <p className="text-[10px] text-slate-500">
-                        {metadata.boneCount} {t.skeleton}
-                      </p>
-                    </div>
-                    <div className="bg-slate-800/50 p-4 rounded-2xl border border-white/5">
-                      <div className="flex items-center gap-3 mb-3 text-indigo-400">
-                        <Layers className="w-4 h-4" />{' '}
-                        <span className="text-xs font-bold uppercase tracking-widest">
-                          {t.sequences}
-                        </span>
-                      </div>
-                      <div className="space-y-2 max-h-48 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700">
-                        {metadata.animations.map((a) => (
-                          <div
-                            key={a.name || 'default'}
-                            className="flex justify-between items-center bg-black/20 p-2 rounded-lg text-[11px]"
-                          >
-                            <span className="font-mono text-slate-300 truncate w-32">
-                              {a.name || 'default'}
-                            </span>
-                            <span className="text-slate-500">{a.duration.toFixed(2)}s</span>
-                          </div>
-                        ))}
-                        {metadata.animations.length === 0 && (
-                          <p className="text-[10px] text-slate-500 italic py-2 text-center">
-                            No animations found
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )}
+              <div className="grid grid-cols-3 gap-2">
+                {EXAMPLES.map((example) => (
+                  <button
+                    key={example.id}
+                    onClick={() => loadExample(example)}
+                    disabled={loading}
+                    className={`p-2 rounded-lg text-xs font-bold transition border ${
+                      selectedExampleId === example.id
+                        ? 'bg-indigo-600 text-white border-indigo-500'
+                        : 'bg-slate-800/50 text-slate-300 border-white/5 hover:bg-slate-700/50 hover:text-white'
+                    } ${loading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
+                    {t.example}
+                    {example.label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-                {activeTab === 'settings' && (
-                  <div className="space-y-6 animate-in fade-in">
-                    <div className="space-y-4">
-                      <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
-                        <Palette className="w-3 h-3" /> {t.visuals}
-                      </h4>
-                      <div className="grid grid-cols-2 gap-4">
-                        <label className="block">
-                          <span className="text-[9px] text-slate-500 uppercase mb-1 block">
-                            {t.bg}
+            <div className="flex border-b border-white/5">
+              {[
+                { id: 'info' as const, icon: Box, label: 'tabModel' },
+                { id: 'settings' as const, icon: Palette, label: 'tabRender' },
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex-1 py-4 flex flex-col items-center gap-1 transition ${activeTab === tab.id ? 'text-indigo-400 border-b-2 border-indigo-400 bg-white/5' : 'text-slate-500 hover:text-slate-300'}`}
+                >
+                  <tab.icon className="w-4 h-4" />
+                  <span className="text-[9px] font-bold uppercase tracking-tighter">
+                    {(t as any)[tab.label]}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-6">
+              {loading ? (
+                <div className="h-full flex flex-col items-center justify-center gap-4 text-slate-500">
+                  <Loader2 className="w-10 h-10 animate-spin text-indigo-500" />
+                  <p className="text-xs font-bold animate-pulse">{t.compiling}</p>
+                </div>
+              ) : metadata ? (
+                <>
+                  {activeTab === 'info' && (
+                    <div className="space-y-6 animate-in slide-in-from-left-4">
+                      <div className="bg-slate-800/50 p-4 rounded-2xl border border-white/5 shadow-inner">
+                        <div className="flex items-center gap-3 mb-3 text-indigo-400">
+                          {metadata.name.toLowerCase().endsWith('.fbx') ? (
+                            <FileCode className="w-4 h-4" />
+                          ) : (
+                            <Box className="w-4 h-4" />
+                          )}
+                          <span className="text-xs font-bold uppercase tracking-widest">
+                            {t.geometry}
                           </span>
-                          <input
-                            type="color"
-                            className="w-full h-8 bg-transparent cursor-pointer rounded overflow-hidden border border-white/10"
-                            value={sceneParams.backgroundColor}
-                            onChange={(e) =>
-                              setSceneParams((p) => ({ ...p, backgroundColor: e.target.value }))
-                            }
-                          />
-                        </label>
-                        <label className="block">
-                          <span className="text-[9px] text-slate-500 uppercase mb-1 block">
-                            {t.exposure}
+                        </div>
+                        <p className="text-sm font-medium truncate mb-1">{metadata.name}</p>
+                        <p className="text-[10px] text-slate-500">
+                          {metadata.boneCount} {t.skeleton}
+                        </p>
+                      </div>
+                      <div className="bg-slate-800/50 p-4 rounded-2xl border border-white/5">
+                        <div className="flex items-center gap-3 mb-3 text-indigo-400">
+                          <Layers className="w-4 h-4" />{' '}
+                          <span className="text-xs font-bold uppercase tracking-widest">
+                            {t.sequences}
                           </span>
-                          <input
-                            type="range"
-                            min="0"
-                            max="3"
-                            step="0.1"
-                            className="w-full accent-indigo-500"
-                            value={sceneParams.exposure}
-                            onChange={(e) =>
-                              setSceneParams((p) => ({ ...p, exposure: Number(e.target.value) }))
-                            }
-                          />
-                        </label>
-                      </div>
-                      <label className="flex items-center justify-between bg-white/5 p-3 rounded-xl border border-white/5">
-                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                          {t.shadows}
-                        </span>
-                        <input
-                          type="checkbox"
-                          className="w-4 h-4 accent-indigo-500"
-                          checked={sceneParams.shadowsEnabled}
-                          onChange={(e) =>
-                            setSceneParams((p) => ({ ...p, shadowsEnabled: e.target.checked }))
-                          }
-                        />
-                      </label>
-                    </div>
-
-                    <div className="space-y-4">
-                      <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
-                        <Sun className="w-3 h-3" /> {t.lightSettings}
-                      </h4>
-                      <div className="space-y-3">
-                        <div className="bg-white/5 p-3 rounded-xl border border-white/5 space-y-3">
-                          <div className="flex justify-between items-center">
-                            <span className="text-[10px] text-slate-400">{t.mainLamp}</span>
-                            <input
-                              type="color"
-                              className="w-6 h-6 bg-transparent cursor-pointer rounded"
-                              value={sceneParams.mainLightColor}
-                              onChange={(e) =>
-                                setSceneParams((p) => ({ ...p, mainLightColor: e.target.value }))
-                              }
-                            />
-                          </div>
-                          <input
-                            type="range"
-                            min="0"
-                            max="10"
-                            step="0.1"
-                            className="w-full accent-indigo-500"
-                            value={sceneParams.mainLightIntensity}
-                            onChange={(e) =>
-                              setSceneParams((p) => ({
-                                ...p,
-                                mainLightIntensity: Number(e.target.value),
-                              }))
-                            }
-                          />
                         </div>
-                        <div className="bg-white/5 p-3 rounded-xl border border-white/5 space-y-3">
-                          <div className="flex justify-between items-center">
-                            <span className="text-[10px] text-slate-400">{t.ambient}</span>
-                            <input
-                              type="color"
-                              className="w-6 h-6 bg-transparent cursor-pointer rounded"
-                              value={sceneParams.ambientColor}
-                              onChange={(e) =>
-                                setSceneParams((p) => ({ ...p, ambientColor: e.target.value }))
-                              }
-                            />
-                          </div>
-                          <input
-                            type="range"
-                            min="0"
-                            max="5"
-                            step="0.1"
-                            className="w-full accent-indigo-500"
-                            value={sceneParams.ambientIntensity}
-                            onChange={(e) =>
-                              setSceneParams((p) => ({
-                                ...p,
-                                ambientIntensity: Number(e.target.value),
-                              }))
-                            }
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="space-y-4">
-                      <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
-                        <Zap className="w-3 h-3" /> {t.animSpeed}
-                      </h4>
-                      <div className="flex items-center gap-4">
-                        <span className="text-xs font-mono text-slate-500">0.1x</span>
-                        <input
-                          type="range"
-                          min="0.1"
-                          max="3"
-                          step="0.1"
-                          className="flex-1 accent-indigo-500"
-                          value={sceneParams.animationSpeed}
-                          onChange={(e) =>
-                            setSceneParams((p) => ({
-                              ...p,
-                              animationSpeed: Number(e.target.value),
-                            }))
-                          }
-                        />
-                        <span className="text-xs font-mono text-indigo-400">
-                          {sceneParams.animationSpeed.toFixed(1)}x
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {activeTab === 'export' && (
-                  <div className="space-y-6 animate-in fade-in">
-                    <div className="space-y-4">
-                      <label className="block">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                          {t.format}
-                        </span>
-                        <select
-                          className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                          value={renderConfig.format}
-                          onChange={(e) =>
-                            setRenderConfig((prev) => ({
-                              ...prev,
-                              format: e.target.value as RenderingConfig['format'],
-                            }))
-                          }
-                        >
-                          <option value="mp4">{t.formatMp4}</option>
-                          <option value="webm">{t.formatWebm}</option>
-                          <option value="gif">{t.formatGif}</option>
-                        </select>
-                      </label>
-                      <label className="block">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                          {t.duration}
-                        </span>
-                        <div className="flex items-center gap-3">
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.1"
-                            className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                            value={renderConfig.duration}
-                            onChange={(e) =>
-                              setRenderConfig((prev) => ({
-                                ...prev,
-                                duration: Number(e.target.value),
-                              }))
-                            }
-                          />
-                        </div>
-                        <p className="text-[10px] text-slate-500 mt-2">{t.durationHint}</p>
-                      </label>
-                      <label className="block">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                          {t.viewMode}
-                        </span>
-                        <div className="grid grid-cols-2 gap-3">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setRenderConfig((prev) => ({ ...prev, viewMode: 'fit' }))
-                            }
-                            className={`px-3 py-2 rounded-xl text-[11px] font-semibold border transition ${
-                              renderConfig.viewMode === 'fit'
-                                ? 'bg-indigo-600 border-indigo-500 text-white'
-                                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
-                            }`}
-                          >
-                            {t.viewModeFit}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setRenderConfig((prev) => ({ ...prev, viewMode: 'current' }))
-                            }
-                            className={`px-3 py-2 rounded-xl text-[11px] font-semibold border transition ${
-                              renderConfig.viewMode === 'current'
-                                ? 'bg-indigo-600 border-indigo-500 text-white'
-                                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
-                            }`}
-                          >
-                            {t.viewModeCurrent}
-                          </button>
-                        </div>
-                      </label>
-                      <label className="block">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                          {t.resolution}
-                        </span>
-                        <select
-                          className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                          value={resolutionValue}
-                          onChange={(e) => {
-                            if (e.target.value === 'custom') {
-                              setResolutionMode('custom');
-                              return;
-                            }
-                            setResolutionMode('preset');
-                            const [w, h] = e.target.value.split('x').map(Number);
-                            setRenderConfig((prev) => ({ ...prev, width: w, height: h }));
-                            syncCropRectForConfig(w, h);
-                          }}
-                        >
-                          {resolutionPresets.map((preset) => (
-                            <option
-                              key={`${preset.width}x${preset.height}`}
-                              value={`${preset.width}x${preset.height}`}
+                        <div className="space-y-2 max-h-48 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700">
+                          {metadata.animations.map((a) => (
+                            <div
+                              key={a.name || 'default'}
+                              className="flex justify-between items-center bg-black/20 p-2 rounded-lg text-[11px]"
                             >
-                              {preset.label}
-                            </option>
+                              <span className="font-mono text-slate-300 truncate w-32">
+                                {a.name || 'default'}
+                              </span>
+                              <span className="text-slate-500">{a.duration.toFixed(2)}s</span>
+                            </div>
                           ))}
-                          <option value="custom">{t.customResolution}</option>
-                        </select>
-                      </label>
-                      <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block">
-                          {t.aspectPresets}
-                        </span>
-                        <div className="grid grid-cols-3 gap-2">
-                          {aspectPresets.map((preset) => (
-                            <button
-                              key={preset.label}
-                              type="button"
-                              onClick={() => applyAspectPreset(preset)}
-                              className="px-2 py-2 rounded-lg text-[11px] font-semibold border border-white/10 text-slate-300 bg-white/5 hover:bg-white/10 transition"
-                            >
-                              {preset.label}
-                            </button>
-                          ))}
+                          {metadata.animations.length === 0 && (
+                            <p className="text-[10px] text-slate-500 italic py-2 text-center">
+                              No animations found
+                            </p>
+                          )}
                         </div>
                       </div>
-                      {resolutionValue === 'custom' && (
+                    </div>
+                  )}
+
+                  {activeTab === 'settings' && (
+                    <div className="space-y-6 animate-in fade-in">
+                      <div className="space-y-4">
+                        <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
+                          <Palette className="w-3 h-3" /> {t.visuals}
+                        </h4>
                         <div className="grid grid-cols-2 gap-4">
                           <label className="block">
                             <span className="text-[9px] text-slate-500 uppercase mb-1 block">
-                              {t.width}
+                              {t.bg}
                             </span>
                             <input
-                              type="number"
-                              min="16"
-                              step="1"
-                              className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                              value={renderConfig.width}
-                              onChange={(e) => {
-                                const nextWidth = toDimension(e.target.value, renderConfig.width);
-                                setRenderConfig((prev) => ({
-                                  ...prev,
-                                  width: nextWidth,
-                                }));
-                                syncCropRectForConfig(nextWidth, renderConfig.height);
-                              }}
+                              type="color"
+                              className="w-full h-8 bg-transparent cursor-pointer rounded overflow-hidden border border-white/10"
+                              value={sceneParams.backgroundColor}
+                              onChange={(e) =>
+                                setSceneParams((p) => ({ ...p, backgroundColor: e.target.value }))
+                              }
                             />
                           </label>
                           <label className="block">
                             <span className="text-[9px] text-slate-500 uppercase mb-1 block">
-                              {t.height}
+                              {t.exposure}
                             </span>
                             <input
-                              type="number"
-                              min="16"
-                              step="1"
-                              className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                              value={renderConfig.height}
-                              onChange={(e) => {
-                                const nextHeight = toDimension(e.target.value, renderConfig.height);
-                                setRenderConfig((prev) => ({
-                                  ...prev,
-                                  height: nextHeight,
-                                }));
-                                syncCropRectForConfig(renderConfig.width, nextHeight);
-                              }}
+                              type="range"
+                              min="0"
+                              max="3"
+                              step="0.1"
+                              className="w-full accent-indigo-500"
+                              value={sceneParams.exposure}
+                              onChange={(e) =>
+                                setSceneParams((p) => ({ ...p, exposure: Number(e.target.value) }))
+                              }
                             />
                           </label>
                         </div>
-                      )}
-                      <label className="block">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                          {t.framerate}
-                        </span>
-                        <select
-                          className="w-full bg-slate-800 border border-white/10 rounded-xl p-3 text-sm focus:ring-2 ring-indigo-500/50 outline-none"
-                          value={renderConfig.fps}
-                          onChange={(e) =>
-                            setRenderConfig((prev) => ({ ...prev, fps: Number(e.target.value) }))
-                          }
-                        >
-                          <option value="24">24 FPS ({t.cinematic})</option>
-                          <option value="30">30 FPS ({t.standard})</option>
-                          <option value="60">60 FPS ({t.smooth})</option>
-                        </select>
-                      </label>
-                      {renderConfig.format === 'gif' ? (
-                        <label className="block">
-                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                            {t.gifQuality}
+                        <label className="flex items-center justify-between bg-white/5 p-3 rounded-xl border border-white/5">
+                          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                            {t.shadows}
                           </span>
-                          <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            className="w-4 h-4 accent-indigo-500"
+                            checked={sceneParams.shadowsEnabled}
+                            onChange={(e) =>
+                              setSceneParams((p) => ({ ...p, shadowsEnabled: e.target.checked }))
+                            }
+                          />
+                        </label>
+                      </div>
+
+                      <div className="space-y-4">
+                        <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
+                          <Sun className="w-3 h-3" /> {t.lightSettings}
+                        </h4>
+                        <div className="space-y-3">
+                          <div className="bg-white/5 p-3 rounded-xl border border-white/5 space-y-3">
+                            <div className="flex justify-between items-center">
+                              <span className="text-[10px] text-slate-400">{t.mainLamp}</span>
+                              <input
+                                type="color"
+                                className="w-6 h-6 bg-transparent cursor-pointer rounded"
+                                value={sceneParams.mainLightColor}
+                                onChange={(e) =>
+                                  setSceneParams((p) => ({ ...p, mainLightColor: e.target.value }))
+                                }
+                              />
+                            </div>
                             <input
                               type="range"
-                              min="1"
-                              max="30"
-                              step="1"
-                              className="flex-1 accent-indigo-500"
-                              value={renderConfig.gifQuality}
+                              min="0"
+                              max="10"
+                              step="0.1"
+                              className="w-full accent-indigo-500"
+                              value={sceneParams.mainLightIntensity}
                               onChange={(e) =>
-                                setRenderConfig((p) => ({
+                                setSceneParams((p) => ({
                                   ...p,
-                                  gifQuality: Number(e.target.value),
+                                  mainLightIntensity: Number(e.target.value),
                                 }))
                               }
                             />
-                            <span className="text-xs font-mono text-indigo-400 w-12">
-                              {renderConfig.gifQuality}
-                            </span>
                           </div>
-                          <p className="text-[10px] text-slate-500 mt-2">{t.gifQualityHint}</p>
-                        </label>
-                      ) : (
-                        <label className="block">
-                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">
-                            {t.quality}
-                          </span>
-                          <div className="flex items-center gap-3">
+                          <div className="bg-white/5 p-3 rounded-xl border border-white/5 space-y-3">
+                            <div className="flex justify-between items-center">
+                              <span className="text-[10px] text-slate-400">{t.ambient}</span>
+                              <input
+                                type="color"
+                                className="w-6 h-6 bg-transparent cursor-pointer rounded"
+                                value={sceneParams.ambientColor}
+                                onChange={(e) =>
+                                  setSceneParams((p) => ({ ...p, ambientColor: e.target.value }))
+                                }
+                              />
+                            </div>
                             <input
                               type="range"
-                              min="2000000"
-                              max="80000000"
-                              step="1000000"
-                              className="flex-1 accent-indigo-500"
-                              value={renderConfig.bitrate}
+                              min="0"
+                              max="5"
+                              step="0.1"
+                              className="w-full accent-indigo-500"
+                              value={sceneParams.ambientIntensity}
                               onChange={(e) =>
-                                setRenderConfig((p) => ({ ...p, bitrate: Number(e.target.value) }))
+                                setSceneParams((p) => ({
+                                  ...p,
+                                  ambientIntensity: Number(e.target.value),
+                                }))
                               }
                             />
-                            <span className="text-xs font-mono text-indigo-400 w-12">
-                              {renderConfig.bitrate / 1000000}
-                            </span>
                           </div>
-                        </label>
-                      )}
+                        </div>
+                      </div>
                     </div>
-                    {renderNotice && <p className="text-[10px] text-amber-400">{renderNotice}</p>}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="h-full flex flex-col items-center justify-center text-slate-600 gap-4 text-center">
-                <Box className="w-12 h-12 opacity-10" />
-                <p className="text-xs uppercase tracking-widest font-bold">{t.waitingInput}</p>
-              </div>
-            )}
-          </div>
-
-          {videoUrl && (
-            <div className="p-6 border-t border-white/5 bg-black/20">
-              <a
-                href={videoUrl}
-                download={`render.${videoFormat}`}
-                className="flex items-center justify-center gap-3 w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-4 rounded-2xl transition shadow-xl shadow-indigo-600/30"
-              >
-                <Download className="w-5 h-5" />
-                {t.exportVideo}
-              </a>
+                  )}
+                </>
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center text-slate-600 gap-4 text-center">
+                  <Box className="w-12 h-12 opacity-10" />
+                  <p className="text-xs uppercase tracking-widest font-bold">{t.waitingInput}</p>
+                </div>
+              )}
             </div>
-          )}
-        </aside>
+          </aside>
+        )}
 
         {/* Viewport */}
         <section ref={handleViewportRef} className="flex-1 relative bg-black group overflow-hidden">
           <canvas ref={canvasRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
 
-          {!isRendering && metadata && (
-            <div className="absolute inset-0 pointer-events-none">
-              <div
-                className="absolute border-2 border-indigo-400/80 rounded-lg shadow-[0_0_0_9999px_rgba(0,0,0,0.35)]"
-                style={{
-                  left: `${cropRect.x * 100}%`,
-                  top: `${cropRect.y * 100}%`,
-                  width: `${cropRect.width * 100}%`,
-                  height: `${cropRect.height * 100}%`,
-                }}
-              >
-                {canAdjustCrop && (
-                  <>
-                    <div
-                      className="absolute inset-x-0 top-0 h-4 cursor-move pointer-events-auto"
-                      style={{ touchAction: 'none' }}
-                      onPointerDown={handleCropPointerDown}
-                      onPointerMove={handleCropPointerMove}
-                      onPointerUp={handleCropPointerUp}
-                      onPointerCancel={handleCropPointerUp}
-                    />
-                    <div
-                      className="absolute inset-x-0 bottom-0 h-4 cursor-move pointer-events-auto"
-                      style={{ touchAction: 'none' }}
-                      onPointerDown={handleCropPointerDown}
-                      onPointerMove={handleCropPointerMove}
-                      onPointerUp={handleCropPointerUp}
-                      onPointerCancel={handleCropPointerUp}
-                    />
-                    <div
-                      className="absolute inset-y-0 left-0 w-4 cursor-move pointer-events-auto"
-                      style={{ touchAction: 'none' }}
-                      onPointerDown={handleCropPointerDown}
-                      onPointerMove={handleCropPointerMove}
-                      onPointerUp={handleCropPointerUp}
-                      onPointerCancel={handleCropPointerUp}
-                    />
-                    <div
-                      className="absolute inset-y-0 right-0 w-4 cursor-move pointer-events-auto"
-                      style={{ touchAction: 'none' }}
-                      onPointerDown={handleCropPointerDown}
-                      onPointerMove={handleCropPointerMove}
-                      onPointerUp={handleCropPointerUp}
-                      onPointerCancel={handleCropPointerUp}
-                    />
-                  </>
-                )}
+          {/* Video Player - Top Left */}
+          {currentVideoUrl && (
+            <div className="absolute left-6 top-6 z-20">
+              <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-2 shadow-[0_24px_60px_rgba(15,23,42,0.55)] backdrop-blur-xl ring-1 ring-indigo-500/10">
+                <video
+                  ref={videoRef}
+                  src={currentVideoUrl}
+                  loop
+                  muted
+                  playsInline
+                  className="w-80 h-auto rounded-xl"
+                />
               </div>
             </div>
           )}
 
-          <div className="absolute top-6 left-6 pointer-events-none">
-            <div className="bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 flex items-center gap-3">
-              <div
-                className={`w-2 h-2 rounded-full ${isRendering ? 'bg-red-500 animate-pulse' : 'bg-green-500'}`}
-              />
-              <span className="text-[10px] font-bold uppercase tracking-widest text-white/70">
-                {isRendering ? t.statusRendering : t.statusReady}
-              </span>
-            </div>
-          </div>
+          {metadata && (
+            <div className="absolute right-6 bottom-6 z-20 pointer-events-none">
+              <div className="pointer-events-auto w-[360px] rounded-2xl border border-white/10 bg-slate-950/70 p-4 shadow-[0_24px_60px_rgba(15,23,42,0.55)] backdrop-blur-xl ring-1 ring-indigo-500/10">
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-indigo-300">
+                    <Activity className="h-4 w-4" />
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.2em]">
+                      {t.motionStats}
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-500">{t.unitHint}</span>
+                </div>
+                <div className="h-px w-full bg-gradient-to-r from-transparent via-indigo-400/40 to-transparent" />
+                <div className="mt-4 space-y-4">
+                  <div className="rounded-xl border border-white/5 bg-slate-900/60 p-3">
+                    <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.2em] text-slate-400">
+                      <span>{t.currentFrame}</span>
+                      <span className="font-mono text-slate-100">{frameText}</span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between text-xs">
+                      <span className="text-slate-500">{t.elapsedTime}</span>
+                      <span className="font-mono text-slate-100">{elapsedText}</span>
+                    </div>
+                  </div>
 
-          <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20">
-            {isRendering ? (
-              <div className="flex flex-col items-center gap-4">
-                {frameProgress.total > 0 && (
-                  <div className="w-64 space-y-2">
-                    <div className="flex items-center justify-between text-[10px] uppercase tracking-widest font-bold text-slate-300">
-                      <span>{t.frameProgress}</span>
-                      <span>
-                        {frameProgress.current}/{frameProgress.total}
+                  <div className="space-y-2 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">{t.moveSpeed}</span>
+                      <span className="font-mono text-slate-100">{speedText}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">{t.stepCount}</span>
+                      <span className="font-mono text-slate-100">{stepCountText}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">{t.leftFootHeight}</span>
+                      <span className="font-mono text-slate-100">{leftFootHeightText}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">{t.rightFootHeight}</span>
+                      <span className="font-mono text-slate-100">{rightFootHeightText}</span>
+                    </div>
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="flex items-center gap-2 text-slate-400 shrink-0">
+                        <Axis3d
+                          className="h-3.5 w-3.5 text-indigo-300/80 shrink-0"
+                          strokeWidth={1.5}
+                        />
+                        {t.axisDelta}
+                      </span>
+                      <span className="font-mono text-[11px] leading-tight text-right text-slate-100 whitespace-nowrap min-w-0">
+                        {axisDeltaText}
                       </span>
                     </div>
-                    <div className="h-2 bg-white/10 rounded-full overflow-hidden border border-white/5 backdrop-blur-sm">
-                      <div
-                        className="h-full bg-indigo-400 transition-all duration-300"
-                        style={{ width: `${framePercent}%` }}
-                      />
+                  </div>
+
+                  <div className="grid gap-3">
+                    <div className="rounded-xl border border-white/5 bg-slate-900/50 p-3">
+                      <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+                        <span>{t.speedTrend}</span>
+                        <span className="font-mono text-slate-100">{speedText}</span>
+                      </div>
+                      <svg
+                        className="mt-2 h-20 w-full"
+                        viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+                        preserveAspectRatio="none"
+                      >
+                        <defs>
+                          <linearGradient id="speedFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#818cf8" stopOpacity="0.35" />
+                            <stop offset="100%" stopColor="#818cf8" stopOpacity="0" />
+                          </linearGradient>
+                          <linearGradient id="speedStroke" x1="0" y1="0" x2="1" y2="0">
+                            <stop offset="0%" stopColor="#a5b4fc" />
+                            <stop offset="100%" stopColor="#c4b5fd" />
+                          </linearGradient>
+                        </defs>
+                        {speedSpark.area && <path d={speedSpark.area} fill="url(#speedFill)" />}
+                        {speedSpark.line && (
+                          <path
+                            d={speedSpark.line}
+                            fill="none"
+                            stroke="url(#speedStroke)"
+                            strokeWidth="2"
+                          />
+                        )}
+                        {speedSpark.last && (
+                          <circle
+                            cx={speedSpark.last.x}
+                            cy={speedSpark.last.y}
+                            r="2.5"
+                            fill="#a5b4fc"
+                          />
+                        )}
+                      </svg>
+                    </div>
+
+                    <div className="rounded-xl border border-white/5 bg-slate-900/50 p-3">
+                      <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+                        <span>{t.stepRate}</span>
+                        <span className="font-mono text-slate-100">{stepRateText}</span>
+                      </div>
+                      <svg
+                        className="mt-2 h-20 w-full"
+                        viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+                        preserveAspectRatio="none"
+                      >
+                        <defs>
+                          <linearGradient id="stepFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.35" />
+                            <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
+                          </linearGradient>
+                          <linearGradient id="stepStroke" x1="0" y1="0" x2="1" y2="0">
+                            <stop offset="0%" stopColor="#38bdf8" />
+                            <stop offset="100%" stopColor="#34d399" />
+                          </linearGradient>
+                        </defs>
+                        {stepSpark.area && <path d={stepSpark.area} fill="url(#stepFill)" />}
+                        {stepSpark.line && (
+                          <path
+                            d={stepSpark.line}
+                            fill="none"
+                            stroke="url(#stepStroke)"
+                            strokeWidth="2"
+                          />
+                        )}
+                        {stepSpark.last && (
+                          <circle
+                            cx={stepSpark.last.x}
+                            cy={stepSpark.last.y}
+                            r="2.5"
+                            fill="#38bdf8"
+                          />
+                        )}
+                      </svg>
                     </div>
                   </div>
-                )}
-                <div className="w-64 space-y-2">
-                  <div className="flex items-center justify-between text-[10px] uppercase tracking-widest font-bold text-slate-300">
-                    <span>{t.rendering}</span>
-                    <span>{progress}%</span>
-                  </div>
-                  <div className="h-2 bg-white/10 rounded-full overflow-hidden border border-white/5 backdrop-blur-sm">
-                    <div
-                      className="h-full bg-indigo-500 transition-all duration-300"
-                      style={{ width: `${progress}%` }}
-                    />
-                  </div>
                 </div>
-                <button
-                  onClick={cancelRendering}
-                  className="flex items-center gap-3 bg-red-600 hover:bg-red-500 text-white px-8 py-4 rounded-full font-bold shadow-2xl transition transform hover:scale-105 active:scale-95"
-                >
-                  <Square className="w-4 h-4 fill-current" />
-                  {t.cancelBtn} ({progress}%)
-                </button>
               </div>
-            ) : (
-              <div className="flex flex-col items-center gap-3">
-                <button
-                  onClick={startRendering}
-                  disabled={!metadata}
-                  className="flex items-center gap-3 bg-white hover:bg-slate-200 disabled:bg-white/5 disabled:text-white/20 text-slate-950 px-10 py-5 rounded-full font-black uppercase tracking-widest transition transform hover:scale-105 active:scale-95 shadow-2xl shadow-white/5"
-                >
-                  <Play className="w-5 h-5 fill-current" />
-                  {t.captureBtn}
-                </button>
-                <button
-                  onClick={logViewParams}
-                  className="text-[10px] uppercase tracking-widest font-bold text-slate-300 hover:text-white transition"
-                >
-                  打印视角参数
-                </button>
-              </div>
-            )}
-          </div>
+            </div>
+          )}
+
+          {metadata && (
+            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-30 pointer-events-none">
+              <button
+                type="button"
+                onClick={togglePause}
+                className="pointer-events-auto flex items-center gap-3 bg-slate-900/80 hover:bg-slate-800 text-white px-10 py-5 rounded-full font-bold uppercase tracking-widest border border-white/10 shadow-2xl backdrop-blur-md transition"
+              >
+                {isPaused ? <Play className="w-5 h-5" /> : <Pause className="w-5 h-5" />}
+                {pauseText}
+              </button>
+            </div>
+          )}
 
           {!file && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-xl animate-in fade-in">
@@ -1712,7 +2033,7 @@ const Converter: React.FC = () => {
                 <div className="relative inline-block">
                   <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-20" />
                   <div className="relative bg-slate-900 w-24 h-24 rounded-3xl flex items-center justify-center mx-auto border border-white/10 shadow-2xl">
-                    <Video className="w-12 h-12 text-indigo-500" />
+                    <Box className="w-12 h-12 text-indigo-500" />
                   </div>
                 </div>
                 <div>
@@ -1722,12 +2043,7 @@ const Converter: React.FC = () => {
                 <label className="inline-flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-2xl cursor-pointer font-black uppercase tracking-widest transition shadow-2xl shadow-indigo-600/40 transform hover:-translate-y-1">
                   <Upload className="w-5 h-5" />
                   {t.dropBtn}
-                  <input
-                    type="file"
-                    accept=".fbx,.glb,.gltf"
-                    className="hidden"
-                    onChange={handleFileUpload}
-                  />
+                  <input type="file" accept=".fbx" className="hidden" onChange={handleFileUpload} />
                 </label>
               </div>
             </div>
@@ -1742,9 +2058,6 @@ const Converter: React.FC = () => {
           </span>
           <span className="flex items-center gap-2">
             <div className="w-1 h-1 bg-indigo-500 rounded-full" /> WebGPU-Ready
-          </span>
-          <span className="flex items-center gap-2">
-            <div className="w-1 h-1 bg-indigo-500 rounded-full" /> {t.codec}: VP9
           </span>
         </div>
       </footer>
